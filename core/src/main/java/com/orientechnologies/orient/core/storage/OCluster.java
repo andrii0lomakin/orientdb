@@ -19,12 +19,20 @@
  */
 package com.orientechnologies.orient.core.storage;
 
+import com.orientechnologies.common.exception.OException;
+import com.orientechnologies.common.io.OIOException;
+import com.orientechnologies.common.io.OIOUtils;
 import com.orientechnologies.orient.core.config.OStorageClusterConfiguration;
 import com.orientechnologies.orient.core.conflict.ORecordConflictStrategy;
+import com.orientechnologies.orient.core.exception.ODatabaseException;
 import com.orientechnologies.orient.core.exception.ORecordNotFoundException;
 import com.orientechnologies.orient.core.storage.impl.local.OClusterBrowsePage;
 import com.orientechnologies.orient.core.storage.impl.local.paginated.atomicoperations.OAtomicOperation;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 
 public interface OCluster {
 
@@ -85,6 +93,26 @@ public interface OCluster {
       byte recordType,
       OPhysicalPosition allocatedPosition,
       OAtomicOperation atomicOperation);
+
+  default OPhysicalPosition createRecord(
+      InputStream content,
+      int recordVersion,
+      byte recordType,
+      OPhysicalPosition allocatedPosition,
+      OAtomicOperation atomicOperation) {
+    final byte[] contentBytes;
+    try (final ByteArrayOutputStream out = new ByteArrayOutputStream(8192)) {
+      OIOUtils.copyStream(content, out);
+      contentBytes = out.toByteArray();
+    } catch (IOException e) {
+      throw OException.wrapException(new OIOException("Error on reading content"), e);
+    }
+
+    return createRecord(
+        contentBytes, recordVersion, recordType,
+        allocatedPosition, atomicOperation
+    );
+  }
 
   boolean deleteRecord(OAtomicOperation atomicOperation, long clusterPosition);
 

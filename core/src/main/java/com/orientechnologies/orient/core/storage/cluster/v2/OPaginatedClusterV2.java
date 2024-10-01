@@ -16,7 +16,9 @@
 package com.orientechnologies.orient.core.storage.cluster.v2;
 
 import com.orientechnologies.common.exception.OException;
+import com.orientechnologies.common.io.InputStreamWindow;
 import com.orientechnologies.common.io.OFileUtils;
+import com.orientechnologies.common.io.OIOException;
 import com.orientechnologies.common.log.OLogManager;
 import com.orientechnologies.common.serialization.types.OByteSerializer;
 import com.orientechnologies.common.serialization.types.OIntegerSerializer;
@@ -47,6 +49,7 @@ import com.orientechnologies.orient.core.storage.impl.local.paginated.atomicoper
 import com.orientechnologies.orient.core.storage.impl.local.paginated.base.ODurablePage;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -332,7 +335,24 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
 
   @Override
   public OPhysicalPosition createRecord(
+      byte[] content,
+      int recordVersion,
+      byte recordType,
+      OPhysicalPosition allocatedPosition,
+      OAtomicOperation atomicOperation) {
+    return createRecordFromBytes(
+        content,
+        content.length,
+        recordVersion,
+        recordType,
+        allocatedPosition,
+        atomicOperation
+    );
+  }
+
+  private OPhysicalPosition createRecordFromBytes(
       final byte[] content,
+      final int contentLength,
       final int recordVersion,
       final byte recordType,
       final OPhysicalPosition allocatedPosition,
@@ -343,9 +363,9 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
           acquireExclusiveLock();
           try {
             final int[] result =
-                serializeRecord(
+                serializeRecordBytes(
                     content,
-                    calculateClusterEntrySize(content.length),
+                    calculateClusterEntrySize(contentLength),
                     recordType,
                     recordVersion,
                     -1,
@@ -365,7 +385,7 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
             final int nextPageOffset = result[1];
             assert result[2] == 0;
 
-            updateClusterState(1, content.length, atomicOperation);
+            updateClusterState(1, contentLength, atomicOperation);
 
             final long clusterPosition;
             if (allocatedPosition != null) {
@@ -382,6 +402,50 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
           } finally {
             releaseExclusiveLock();
           }
+        });
+  }
+
+  @Override
+  public OPhysicalPosition createRecord(
+      InputStream content,
+      int recordVersion,
+      byte recordType,
+      OPhysicalPosition allocatedPosition,
+      OAtomicOperation atomicOperation
+  ) {
+
+    // todo: don't forget to close the stream
+    final InputStreamWindow source;
+    try {
+      source = new InputStreamWindow(content, MAX_ENTRY_SIZE * 2);
+    } catch (IOException e) {
+      throw OException.wrapException(new OIOException("Error on reading content from record"), e);
+    }
+
+    if (source.size() <= MIN_ENTRY_SIZE) {
+      return createRecordFromBytes(
+          source.get(),
+          source.size(),
+          recordVersion,
+          recordType,
+          allocatedPosition,
+          atomicOperation
+      );
+    }
+
+    return calculateInsideComponentOperation(
+        atomicOperation,
+        operation -> {
+
+          acquireExclusiveLock();
+
+          try {
+
+            return null;
+          } finally {
+            releaseExclusiveLock();
+          }
+
         });
   }
 
@@ -413,7 +477,40 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
     return page;
   }
 
-  private int[] serializeRecord(
+  private int[] serializeRecordStream(
+      final InputStreamWindow source,
+      final byte recordType,
+      final int recordVersion,
+      final long nextRecordPointer,
+      final OAtomicOperation atomicOperation,
+      final Int2ObjectFunction<OClusterPage> pageSupplier,
+      final Consumer<OClusterPage> pagePostProcessor) throws IOException {
+    
+
+    while (source.size() > 0) {
+
+      final int chunkSize = calculateChunkSize(source.size());
+      final OClusterPage page = pageSupplier.apply(source.size());
+      if (page == null) {
+        // todo
+        return null;
+      }
+
+      try {
+        int availableInPage = page.getMaxRecordSize();
+        if (availableInPage > MIN_ENTRY_SIZE) {
+          final int pageChunkSize = Math.min(availableInPage, chunkSize);
+
+        }
+      } finally {
+        pagePostProcessor.accept(page);
+      }
+    }
+
+    return null;
+  }
+
+  private int[] serializeRecordBytes(
       final byte[] content,
       final int len,
       final byte recordType,
@@ -499,12 +596,12 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
 
     // there are records data to write
     if (contentSize > 0) {
-      final int contentToWrite = Math.min(contentSize, offset);
+      final int contentToWrite = Math.min(contentSize, offset); // MIN(BR, CH)
       System.arraycopy(
           recordContent,
-          contentSize - contentToWrite,
+          contentSize - contentToWrite, // BR - MIN(BR, CH) = 0 or BR - CH
           chunk,
-          offset - contentToWrite,
+          offset - contentToWrite, // CH - MIN(BR, CH) = 0 or CH - BR
           contentToWrite);
       written = contentToWrite;
     }
@@ -901,7 +998,7 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
             final ListIterator<OClusterPage> reverseIterator =
                 storedPages.listIterator(storedPages.size());
             int[] result =
-                serializeRecord(
+                serializeRecordBytes(
                     content,
                     calculateClusterEntrySize(content.length),
                     recordType,
@@ -938,7 +1035,7 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
 
             if (result[2] != 0) {
               result =
-                  serializeRecord(
+                  serializeRecordBytes(
                       content,
                       result[2],
                       recordType,
