@@ -6,41 +6,52 @@ import java.io.InputStream;
 public class InputStreamWindow {
 
   private final InputStream inputStream;
-  private final byte[] content;
+  private final byte[] buffer;
 
-  private int size = 0;
+  private int bufferSize = 0;
 
-  public InputStreamWindow(InputStream inputStream, int windowSize) throws IOException {
+  public InputStreamWindow(
+      InputStream inputStream,
+      int windowSize
+  ) throws IOException {
     this.inputStream = inputStream;
-    this.content = new byte[windowSize];
+    this.buffer = new byte[windowSize];
     advance(windowSize);
   }
 
   public byte[] get() {
-    return content;
+    return buffer;
+  }
+
+  public int availableBytes(int offset, int limit) {
+    return Math.max(Math.min(bufferSize - offset, limit), 0);
   }
 
   public int size() {
-    return size;
+    return bufferSize;
   }
 
-  public boolean advance() throws IOException {
-    return advance(content.length);
+  public boolean hasContent(int offset) {
+    return bufferSize > offset;
+  }
+
+  public boolean hasContent() {
+    return hasContent(0);
   }
 
   public boolean advance(int advanceBytes) throws IOException {
 
     int newSize = 0;
-    if (advanceBytes < size) {
-      System.arraycopy(content, advanceBytes, content, 0, size - advanceBytes);
-      newSize = size - advanceBytes;
+    if (advanceBytes < bufferSize) {
+      System.arraycopy(buffer, advanceBytes, buffer, 0, bufferSize - advanceBytes);
+      newSize = bufferSize - advanceBytes;
     }
 
-    final int bytesToRead = content.length - newSize;
+    final int bytesToRead = buffer.length - newSize;
 
-    newSize += inputStream.read(content, newSize, bytesToRead);
+    newSize += inputStream.read(buffer, newSize, bytesToRead);
 
-    size = Math.max(newSize, 0);
-    return size > 0;
+    bufferSize = Math.max(newSize, 0);
+    return bufferSize > 0;
   }
 }

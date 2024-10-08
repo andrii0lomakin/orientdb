@@ -13,17 +13,17 @@ public class InputStreamWindowTest {
   public void testSimpleRead() throws IOException {
 
     final var stream = new ByteArrayInputStream(ALL_BYTES);
-    final var pageSize = 100;
-    final var window = new InputStreamWindow(stream, pageSize);
+    final var windowSize = 100;
+    final var window = new InputStreamWindow(stream, windowSize);
 
     int pageIdx = 0;
     final var result  = new byte[ALL_BYTES.length];
     while (window.size() > 0) {
       for (int i = 0; i < window.size(); i++) {
-        result[pageIdx * pageSize + i] = window.get()[i];
+        result[pageIdx * windowSize + i] = window.get()[i];
       }
 
-      window.advance();
+      window.advance(windowSize);
       pageIdx++;
     }
 

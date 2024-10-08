@@ -85,6 +85,88 @@ public final class OClusterPage extends ODurablePage {
     setFreeSpace(PAGE_SIZE - PAGE_INDEXES_OFFSET);
   }
 
+  // todo: implement appendRecord as findRecordPosition + writeEntry
+  public int[] findRecordPosition(
+      final int recordVersion,
+      final int recordSize,
+      final int requestedPosition,
+      final IntSet bookedRecordPositions) {
+    int freePosition = getFreePosition();
+    final int indexesLength = getPageIndexesLength();
+
+    final int lastEntryIndexPosition = computePointerPosition(indexesLength);
+    int entrySize = recordSize + 3 * OIntegerSerializer.INT_SIZE;
+    int freeListHeader = getFreeListHeader();
+
+    if (!checkSpace(entrySize)) {
+      return new int[] {-1, -1};
+    }
+
+    if (freePosition - entrySize < lastEntryIndexPosition + INDEX_ITEM_SIZE) {
+      if (requestedPosition < 0) {
+        final int[] findHole = findHole(entrySize, freePosition);
+
+        if (findHole != null) {
+          final int entryPosition = findHole[0];
+          final int holeSize = findHole[1];
+
+          final ORawPairIntegerBoolean entry =
+              findFirstEmptySlot(
+                  recordVersion,
+                  entryPosition,
+                  indexesLength,
+                  entrySize,
+                  freeListHeader,
+                  true,
+                  bookedRecordPositions);
+
+          if (entry != null) {
+            assert entry.second; // allocated from free list
+
+            final int entryIndex = entry.first;
+
+            assert holeSize >= entrySize;
+            if (holeSize != entrySize) {
+              setIntValue(entryPosition + entrySize, -(holeSize - entrySize));
+            }
+
+            return new int[] {entryPosition, entryIndex};
+          }
+        }
+      }
+
+      doDefragmentation();
+    }
+
+    freePosition = getFreePosition();
+    freePosition -= entrySize;
+
+    final int entryIndex;
+
+    if (requestedPosition < 0) {
+      final ORawPairIntegerBoolean entry =
+          findFirstEmptySlot(
+              recordVersion,
+              freePosition,
+              indexesLength,
+              entrySize,
+              freeListHeader,
+              false,
+              bookedRecordPositions);
+      Objects.requireNonNull(entry);
+      entryIndex = entry.first;
+    } else {
+      insertIntoRequestedSlot(
+          recordVersion, freePosition, entrySize, requestedPosition, freeListHeader);
+      entryIndex = requestedPosition;
+    }
+
+    // todo: is it ok to set this before write?
+    setFreePosition(freePosition);
+
+    return new int[]{freePosition, entryIndex};
+  }
+
   public int appendRecord(
       final int recordVersion,
       final byte[] record,
@@ -143,7 +225,7 @@ public final class OClusterPage extends ODurablePage {
     freePosition = getFreePosition();
     freePosition -= entrySize;
 
-    int entryIndex;
+    final int entryIndex;
 
     if (requestedPosition < 0) {
       final ORawPairIntegerBoolean entry =
@@ -170,7 +252,7 @@ public final class OClusterPage extends ODurablePage {
     return entryIndex;
   }
 
-  private void writeEntry(byte[] record, int entryPosition, int entrySize, int entryIndex) {
+  public void writeEntry(byte[] record, int entryPosition, int entrySize, int entryIndex) {
     assert entryPosition + entrySize <= PAGE_SIZE;
 
     setRecordEntrySize(entryPosition, entrySize);

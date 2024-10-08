@@ -48,6 +48,7 @@ import com.orientechnologies.orient.core.storage.impl.local.OClusterBrowsePage;
 import com.orientechnologies.orient.core.storage.impl.local.paginated.atomicoperations.OAtomicOperation;
 import com.orientechnologies.orient.core.storage.impl.local.paginated.base.ODurablePage;
 import it.unimi.dsi.fastutil.ints.Int2ObjectFunction;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteOrder;
@@ -340,14 +341,21 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       byte recordType,
       OPhysicalPosition allocatedPosition,
       OAtomicOperation atomicOperation) {
-    return createRecordFromBytes(
-        content,
-        content.length,
+    return createRecord(
+        new ByteArrayInputStream(content),
         recordVersion,
         recordType,
         allocatedPosition,
         atomicOperation
     );
+//    return createRecordFromBytes(
+//        content,
+//        content.length,
+//        recordVersion,
+//        recordType,
+//        allocatedPosition,
+//        atomicOperation
+//    );
   }
 
   private OPhysicalPosition createRecordFromBytes(
@@ -422,16 +430,16 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       throw OException.wrapException(new OIOException("Error on reading content from record"), e);
     }
 
-    if (source.size() <= MIN_ENTRY_SIZE) {
-      return createRecordFromBytes(
-          source.get(),
-          source.size(),
-          recordVersion,
-          recordType,
-          allocatedPosition,
-          atomicOperation
-      );
-    }
+//    if (!source.hasContent(MIN_ENTRY_SIZE)) {
+//      return createRecordFromBytes(
+//          source.get(),
+//          source.size(),
+//          recordVersion,
+//          recordType,
+//          allocatedPosition,
+//          atomicOperation
+//      );
+//    }
 
     return calculateInsideComponentOperation(
         atomicOperation,
@@ -441,7 +449,41 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
 
           try {
 
-            return null;
+            final int[] result =
+                serializeRecordStream(
+                    source,
+                    recordType,
+                    recordVersion,
+                    -1,
+                    atomicOperation,
+                    entrySize -> findNewPageToWrite(atomicOperation, entrySize),
+                    page -> {
+                      final OCacheEntry cacheEntry = page.getCacheEntry();
+                      try {
+                        cacheEntry.close();
+                      } catch (final IOException e) {
+                        throw OException.wrapException(
+                            new OPaginatedClusterException("Can not store the record", this), e);
+                      }
+                    });
+
+            final int nextPageIndex = result[0];
+            final int nextPageOffset = result[1];
+            assert result[2] == 0;
+
+            final long clusterPosition;
+            if (allocatedPosition != null) {
+              clusterPositionMap.update(
+                  allocatedPosition.clusterPosition,
+                  new OClusterPositionMapBucket.PositionEntry(nextPageIndex, nextPageOffset),
+                  atomicOperation);
+              clusterPosition = allocatedPosition.clusterPosition;
+            } else {
+              clusterPosition =
+                  clusterPositionMap.add(nextPageIndex, nextPageOffset, atomicOperation);
+            }
+            return createPhysicalPosition(recordType, clusterPosition, recordVersion);
+
           } finally {
             releaseExclusiveLock();
           }
@@ -485,29 +527,105 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       final OAtomicOperation atomicOperation,
       final Int2ObjectFunction<OClusterPage> pageSupplier,
       final Consumer<OClusterPage> pagePostProcessor) throws IOException {
-    
 
-    while (source.size() > 0) {
+    assert source.hasContent();
 
-      final int chunkSize = calculateChunkSize(source.size());
-      final OClusterPage page = pageSupplier.apply(source.size());
-      if (page == null) {
-        // todo
-        return null;
-      }
+    OClusterPage pendingPage = null;
+    int pendingPagePosition = -1;
+    int pendingPageOffset = -1;
+    int pendingPageBytes = -1;
 
-      try {
-        int availableInPage = page.getMaxRecordSize();
+    int firstPageIndex = -1;
+    int firstPageOffset = -1;
+
+    while (source.hasContent()) {
+      final long nextPagePointer;
+      final int nextPagePosition;
+      final int nextPageOffset;
+      final int nextPageBytes;
+      final OClusterPage nextPage;
+
+      // 1. checking the next page
+      final int availableContentSize = source.availableBytes(
+          pendingPage == null ? 0 : pendingPageBytes,
+          MAX_ENTRY_SIZE
+      );
+
+      if (availableContentSize > 0) {
+        // todo: handle case when availableContentSize is 0, but cluster entry metadata is not written yet
+        final int requiredEntrySpace = calculateClusterEntrySize(availableContentSize);
+        nextPage = pageSupplier.apply(requiredEntrySpace);
+        assert nextPage != null;
+
+        final int availableInPage = nextPage.getMaxRecordSize();
         if (availableInPage > MIN_ENTRY_SIZE) {
-          final int pageChunkSize = Math.min(availableInPage, chunkSize);
+          nextPageBytes = Math.min(availableInPage - MIN_ENTRY_SIZE, requiredEntrySpace);
 
+          final int[] recPosPair = nextPage.findRecordPosition(
+              recordVersion,
+              calculateChunkSize(nextPageBytes),
+              -1,
+              atomicOperation.getBookedRecordPositions(id, nextPage.getCacheEntry().getPageIndex())
+          );
+          nextPagePosition = recPosPair[0];
+          nextPageOffset = recPosPair[1];
+          assert nextPageOffset >= 0;
+          nextPagePointer =
+              createPagePointer(nextPage.getCacheEntry().getPageIndex(), nextPageOffset);
+
+          if (firstPageIndex < 0) {
+            firstPageIndex = nextPage.getCacheEntry().getPageIndex();
+            firstPageOffset = nextPageOffset;
+          }
+        } else {
+
+          continue; // moving to the next page, this one doesn't have enough space
         }
-      } finally {
-        pagePostProcessor.accept(page);
+      } else {
+        // this is the last page. todo: add assert
+        nextPage = null;
+        nextPageBytes = -1;
+        nextPagePosition = -1;
+        nextPageOffset = -1;
+        nextPagePointer = nextRecordPointer;
       }
+
+      // 2. serializing the previous page
+      if (pendingPage != null) {
+        final ORawPairObjectInteger<byte[]> pair =
+            serializeEntryChunk(
+                source.get(),
+                calculateChunkSize(pendingPageBytes),
+                calculateClusterEntrySize(source.availableBytes(0, MAX_ENTRY_SIZE)),
+                nextPagePointer,
+                recordType
+            );
+
+        final byte[] chunk = pair.first;
+        final int chuckSize =
+            chunk.length + 3 * OIntegerSerializer.INT_SIZE; // todo: move this inside OClusterPage?
+        pendingPage.writeEntry(chunk, pendingPagePosition, chuckSize, pendingPageOffset);
+
+        // this is not wrapped in try-finally now, is it ok?
+        pagePostProcessor.accept(pendingPage);
+
+        source.advance(pendingPageBytes);
+
+        // todo: validate this:
+        freeSpaceMap.updatePageFreeSpace(
+            atomicOperation,
+            pendingPage.getCacheEntry().getPageIndex(),
+            pendingPage.getMaxRecordSize()
+        );
+      }
+
+      pendingPage = nextPage;
+      pendingPagePosition = nextPagePosition;
+      pendingPageOffset = nextPageOffset;
+      pendingPageBytes = nextPageBytes;
     }
 
-    return null;
+    return new int[] {firstPageIndex, firstPageOffset, 0};
   }
 
   private int[] serializeRecordBytes(
