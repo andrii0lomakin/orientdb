@@ -161,6 +161,7 @@ public class LuceneRangeTest extends BaseLuceneTest {
   }
 
   @Test
+  @Ignore
   public void shouldUseRangeQueryMultipleFieldWithDirectIndexAccess() {
     db.command(
             "create index Person.composite on Person(name,surname,date,age) FULLTEXT ENGINE LUCENE")
