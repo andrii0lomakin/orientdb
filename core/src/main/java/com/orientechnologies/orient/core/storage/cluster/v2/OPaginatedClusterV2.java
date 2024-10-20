@@ -341,21 +341,21 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       byte recordType,
       OPhysicalPosition allocatedPosition,
       OAtomicOperation atomicOperation) {
-    return createRecord(
-        new ByteArrayInputStream(content),
-        recordVersion,
-        recordType,
-        allocatedPosition,
-        atomicOperation
-    );
-//    return createRecordFromBytes(
-//        content,
-//        content.length,
+//    return createRecord(
+//        new ByteArrayInputStream(content),
 //        recordVersion,
 //        recordType,
 //        allocatedPosition,
 //        atomicOperation
 //    );
+    return createRecordFromBytes(
+        content,
+        content.length,
+        recordVersion,
+        recordType,
+        allocatedPosition,
+        atomicOperation
+    );
   }
 
   private OPhysicalPosition createRecordFromBytes(
@@ -469,7 +469,9 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
 
             final int nextPageIndex = result[0];
             final int nextPageOffset = result[1];
-            assert result[2] == 0;
+            final int contentLength = result[2];
+
+            updateClusterState(1, contentLength, atomicOperation);
 
             final long clusterPosition;
             if (allocatedPosition != null) {
@@ -538,11 +540,13 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
     int firstPageIndex = -1;
     int firstPageOffset = -1;
 
+    int contentSize = -calculateClusterEntrySize(0);
+
     while (source.hasContent()) {
-      final long nextPagePointer;
       final int nextPagePosition;
       final int nextPageOffset;
       final int nextPageBytes;
+      final int nextPageIndex;
       final OClusterPage nextPage;
 
       // 1. checking the next page
@@ -557,9 +561,9 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
         nextPage = pageSupplier.apply(requiredEntrySpace);
         assert nextPage != null;
 
-        final int availableInPage = nextPage.getMaxRecordSize();
-        if (availableInPage > MIN_ENTRY_SIZE) {
-          nextPageBytes = Math.min(availableInPage - MIN_ENTRY_SIZE, requiredEntrySpace);
+        final int availableInPage = nextPage.getMaxRecordSize() - MIN_ENTRY_SIZE;
+        if (availableInPage > 0) {
+          nextPageBytes = Math.min(availableInPage, requiredEntrySpace);
 
           final int[] recPosPair = nextPage.findRecordPosition(
               recordVersion,
@@ -568,17 +572,18 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
               atomicOperation.getBookedRecordPositions(id, nextPage.getCacheEntry().getPageIndex())
           );
           nextPagePosition = recPosPair[0];
+          nextPageIndex = nextPage.getCacheEntry().getPageIndex();
           nextPageOffset = recPosPair[1];
           assert nextPageOffset >= 0;
-          nextPagePointer =
-              createPagePointer(nextPage.getCacheEntry().getPageIndex(), nextPageOffset);
 
           if (firstPageIndex < 0) {
-            firstPageIndex = nextPage.getCacheEntry().getPageIndex();
+            firstPageIndex = nextPageIndex;
             firstPageOffset = nextPageOffset;
           }
+
         } else {
 
+          // todo: test this part carefully.
           continue; // moving to the next page, this one doesn't have enough space
         }
       } else {
@@ -586,18 +591,21 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
         nextPage = null;
         nextPageBytes = -1;
         nextPagePosition = -1;
+        nextPageIndex = -1;
         nextPageOffset = -1;
-        nextPagePointer = nextRecordPointer;
       }
 
       // 2. serializing the previous page
       if (pendingPage != null) {
+        contentSize += pendingPageBytes;
         final ORawPairObjectInteger<byte[]> pair =
             serializeEntryChunk(
                 source.get(),
+                contentSize,
                 calculateChunkSize(pendingPageBytes),
                 calculateClusterEntrySize(source.availableBytes(0, MAX_ENTRY_SIZE)),
-                nextPagePointer,
+                nextPage == null ? nextRecordPointer
+                    : createPagePointer(nextPageIndex, nextPageOffset),
                 recordType
             );
 
@@ -625,7 +633,7 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       pendingPageBytes = nextPageBytes;
     }
 
-    return new int[] {firstPageIndex, firstPageOffset, 0};
+    return new int[]{firstPageIndex, firstPageOffset, contentSize};
   }
 
   private int[] serializeRecordBytes(
@@ -661,7 +669,9 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
 
           final ORawPairObjectInteger<byte[]> pair =
               serializeEntryChunk(
-                  content, pageChunkSize, bytesToWrite, nextRecordPointers, recordType);
+                  content, content.length, pageChunkSize, bytesToWrite,
+                  nextRecordPointers, recordType
+              );
           final byte[] chunk = pair.first;
 
           final OCacheEntry cacheEntry = page.getCacheEntry();
@@ -697,10 +707,12 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
 
   private ORawPairObjectInteger<byte[]> serializeEntryChunk(
       final byte[] recordContent,
+      final int recordLength,
       final int chunkSize,
       final int bytesToWrite,
       final long nextPagePointer,
-      final byte recordType) {
+      final byte recordType
+  ) {
     final byte[] chunk = new byte[chunkSize];
     int offset = chunkSize - OLongSerializer.LONG_SIZE;
 
@@ -741,7 +753,7 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
         if (spaceLeft == OIntegerSerializer.INT_SIZE + OByteSerializer.BYTE_SIZE) {
           chunk[0] = recordType;
           OIntegerSerializer.INSTANCE.serializeNative(
-              recordContent.length, chunk, OByteSerializer.BYTE_SIZE);
+              recordLength, chunk, OByteSerializer.BYTE_SIZE);
           chunk[firstRecordOffset] = 1;
 
           written += OIntegerSerializer.INT_SIZE + OByteSerializer.BYTE_SIZE;

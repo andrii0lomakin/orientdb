@@ -41,6 +41,11 @@ public class InputStreamWindow {
 
   public boolean advance(int advanceBytes) throws IOException {
 
+    if (advanceBytes > buffer.length) {
+      // this behavior is not needed now
+      throw new IOException("Cannot advance more than the buffer size");
+    }
+
     int newSize = 0;
     if (advanceBytes < bufferSize) {
       System.arraycopy(buffer, advanceBytes, buffer, 0, bufferSize - advanceBytes);
@@ -49,7 +54,11 @@ public class InputStreamWindow {
 
     final int bytesToRead = buffer.length - newSize;
 
-    newSize += inputStream.read(buffer, newSize, bytesToRead);
+    final int bytesRead = inputStream.read(buffer, newSize, bytesToRead);
+
+    if (bytesRead > 0) {
+      newSize += bytesRead;
+    }
 
     bufferSize = Math.max(newSize, 0);
     return bufferSize > 0;

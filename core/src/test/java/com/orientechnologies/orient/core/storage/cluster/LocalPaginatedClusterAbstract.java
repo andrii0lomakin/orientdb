@@ -1,5 +1,7 @@
 package com.orientechnologies.orient.core.storage.cluster;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
 import com.orientechnologies.common.exception.OException;
 import com.orientechnologies.common.exception.OHighLevelException;
 import com.orientechnologies.common.types.OModifiableInteger;
@@ -149,7 +151,7 @@ public abstract class LocalPaginatedClusterAbstract {
     Assert.assertNotNull(rawBuffer);
 
     Assert.assertEquals(rawBuffer.version, recordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(smallRecord);
+    assertThat(rawBuffer.buffer).isEqualTo(smallRecord);
     Assert.assertEquals(rawBuffer.recordType, 1);
   }
 
@@ -189,7 +191,49 @@ public abstract class LocalPaginatedClusterAbstract {
     Assert.assertNotNull(rawBuffer);
 
     Assert.assertEquals(rawBuffer.version, recordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(bigRecord);
+    assertThat(rawBuffer.buffer).isEqualTo(bigRecord);
+    Assert.assertEquals(rawBuffer.recordType, 1);
+  }
+
+  @Test
+  public void testAddOneMediumRecord() throws IOException {
+    byte[] mediumRecord = new byte[10000];
+    for (int i = 0, j = 0; i < mediumRecord.length; i++, j = (j + 1) % 100) {
+      mediumRecord[i] = (byte) j;
+    }
+
+    final int recordVersion = 2;
+
+    final OPhysicalPosition[] physicalPosition = new OPhysicalPosition[1];
+    OAtomicOperationsManager atomicOperationsManager = storage.getAtomicOperationsManager();
+    try {
+      atomicOperationsManager.executeInsideAtomicOperation(
+          null,
+          atomicOperation -> {
+            physicalPosition[0] =
+                paginatedCluster.createRecord(
+                    mediumRecord, recordVersion, (byte) 1, null, atomicOperation);
+//            throw new RollbackException();
+          });
+    } catch (RollbackException ignore) {
+    }
+
+//    Assert.assertEquals(0, paginatedCluster.getEntries());
+    Assert.assertNull(paginatedCluster.readRecord(physicalPosition[0].clusterPosition, false));
+
+    atomicOperationsManager.executeInsideAtomicOperation(
+        null,
+        atomicOperation ->
+            physicalPosition[0] =
+                paginatedCluster.createRecord(
+                    mediumRecord, recordVersion, (byte) 1, null, atomicOperation));
+
+    ORawBuffer rawBuffer = paginatedCluster.readRecord(physicalPosition[0].clusterPosition, false);
+    Assert.assertNotNull(rawBuffer);
+
+    Assert.assertEquals(rawBuffer.version, recordVersion);
+    assertThat(rawBuffer.buffer.length).isEqualTo(mediumRecord.length);
+    assertThat(rawBuffer.buffer).isEqualTo(mediumRecord);
     Assert.assertEquals(rawBuffer.recordType, 1);
   }
 
@@ -267,7 +311,7 @@ public abstract class LocalPaginatedClusterAbstract {
 
       Assert.assertEquals(rawBuffer.version, recordVersion);
 
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
       Assert.assertEquals(rawBuffer.recordType, 2);
     }
   }
@@ -355,7 +399,7 @@ public abstract class LocalPaginatedClusterAbstract {
       Assert.assertNotNull(rawBuffer);
 
       Assert.assertEquals(rawBuffer.version, recordVersion);
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
       Assert.assertEquals(rawBuffer.recordType, 2);
     }
   }
@@ -435,7 +479,7 @@ public abstract class LocalPaginatedClusterAbstract {
       Assert.assertNotNull(rawBuffer);
 
       Assert.assertEquals(rawBuffer.version, recordVersion);
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
       Assert.assertEquals(rawBuffer.recordType, 2);
     }
   }
@@ -577,7 +621,7 @@ public abstract class LocalPaginatedClusterAbstract {
         Assert.assertNotNull(rawBuffer);
 
         Assert.assertEquals(rawBuffer.version, recordVersion);
-        Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+        assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
         Assert.assertEquals(rawBuffer.recordType, 2);
       }
     }
@@ -616,7 +660,7 @@ public abstract class LocalPaginatedClusterAbstract {
       Assert.assertNotNull(rawBuffer);
 
       Assert.assertEquals(rawBuffer.version, recordVersion);
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
       Assert.assertEquals(rawBuffer.recordType, 2);
     }
   }
@@ -680,7 +724,7 @@ public abstract class LocalPaginatedClusterAbstract {
         Assert.assertNotNull(rawBuffer);
 
         Assert.assertEquals(rawBuffer.version, recordVersion);
-        Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+        assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
         Assert.assertEquals(rawBuffer.recordType, 2);
       }
     }
@@ -719,7 +763,7 @@ public abstract class LocalPaginatedClusterAbstract {
       Assert.assertNotNull(rawBuffer);
 
       Assert.assertEquals(rawBuffer.version, recordVersion);
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
       Assert.assertEquals(rawBuffer.recordType, 2);
     }
   }
@@ -778,7 +822,7 @@ public abstract class LocalPaginatedClusterAbstract {
         Assert.assertNotNull(rawBuffer);
 
         Assert.assertEquals(rawBuffer.version, recordVersion);
-        Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+        assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
         Assert.assertEquals(rawBuffer.recordType, 2);
       }
     }
@@ -817,7 +861,7 @@ public abstract class LocalPaginatedClusterAbstract {
       Assert.assertNotNull(rawBuffer);
 
       Assert.assertEquals(rawBuffer.version, recordVersion);
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
       Assert.assertEquals(rawBuffer.recordType, 2);
     }
   }
@@ -894,7 +938,7 @@ public abstract class LocalPaginatedClusterAbstract {
       Assert.assertNotNull(rawBuffer);
 
       Assert.assertEquals(rawBuffer.version, recordVersion);
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
       Assert.assertEquals(rawBuffer.recordType, 2);
     }
   }
@@ -933,7 +977,7 @@ public abstract class LocalPaginatedClusterAbstract {
     Assert.assertNotNull(rawBuffer);
 
     Assert.assertEquals(recordVersion, rawBuffer.version);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 0});
+    assertThat(rawBuffer.buffer).isEqualTo(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 0});
     Assert.assertEquals(rawBuffer.recordType, 1);
 
     atomicOperationsManager.executeInsideAtomicOperation(
@@ -949,7 +993,7 @@ public abstract class LocalPaginatedClusterAbstract {
     rawBuffer = paginatedCluster.readRecord(physicalPosition.clusterPosition, false);
 
     Assert.assertEquals(rawBuffer.version, updatedRecordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(updatedRecord);
+    assertThat(rawBuffer.buffer).isEqualTo(updatedRecord);
     Assert.assertEquals(rawBuffer.recordType, 2);
   }
 
@@ -987,7 +1031,7 @@ public abstract class LocalPaginatedClusterAbstract {
     ORawBuffer rawBuffer = paginatedCluster.readRecord(physicalPosition.clusterPosition, false);
     Assert.assertNotNull(rawBuffer);
     Assert.assertEquals(rawBuffer.version, recordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 0});
+    assertThat(rawBuffer.buffer).isEqualTo(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 0});
     Assert.assertEquals(rawBuffer.recordType, 1);
 
     atomicOperationsManager.executeInsideAtomicOperation(
@@ -1003,7 +1047,7 @@ public abstract class LocalPaginatedClusterAbstract {
 
     Assert.assertEquals(rawBuffer.version, updateRecordVersion);
 
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(updatedRecord);
+    assertThat(rawBuffer.buffer).isEqualTo(updatedRecord);
     Assert.assertEquals(rawBuffer.recordType, 2);
   }
 
@@ -1043,7 +1087,7 @@ public abstract class LocalPaginatedClusterAbstract {
     Assert.assertNotNull(rawBuffer);
 
     Assert.assertEquals(rawBuffer.version, recordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 0});
+    assertThat(rawBuffer.buffer).isEqualTo(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 0});
     Assert.assertEquals(rawBuffer.recordType, 1);
 
     atomicOperationsManager.executeInsideAtomicOperation(
@@ -1059,7 +1103,7 @@ public abstract class LocalPaginatedClusterAbstract {
     rawBuffer = paginatedCluster.readRecord(physicalPosition.clusterPosition, false);
 
     Assert.assertEquals(rawBuffer.version, updateRecordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(smallRecord);
+    assertThat(rawBuffer.buffer).isEqualTo(smallRecord);
     Assert.assertEquals(rawBuffer.recordType, 2);
   }
 
@@ -1085,7 +1129,7 @@ public abstract class LocalPaginatedClusterAbstract {
     Assert.assertNotNull(rawBuffer);
 
     Assert.assertEquals(rawBuffer.version, recordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(bigRecord);
+    assertThat(rawBuffer.buffer).isEqualTo(bigRecord);
     Assert.assertEquals(rawBuffer.recordType, 1);
 
     final int updatedRecordVersion = 3;
@@ -1111,7 +1155,7 @@ public abstract class LocalPaginatedClusterAbstract {
     Assert.assertNotNull(rawBuffer);
 
     Assert.assertEquals(rawBuffer.version, recordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(bigRecord);
+    assertThat(rawBuffer.buffer).isEqualTo(bigRecord);
     Assert.assertEquals(rawBuffer.recordType, 1);
 
     atomicOperationsManager.executeInsideAtomicOperation(
@@ -1126,7 +1170,7 @@ public abstract class LocalPaginatedClusterAbstract {
     rawBuffer = paginatedCluster.readRecord(physicalPosition.clusterPosition, false);
 
     Assert.assertEquals(rawBuffer.version, recordVersion);
-    Assertions.assertThat(rawBuffer.buffer).isEqualTo(updatedBigRecord);
+    assertThat(rawBuffer.buffer).isEqualTo(updatedBigRecord);
     Assert.assertEquals(rawBuffer.recordType, 2);
   }
 
@@ -1208,7 +1252,7 @@ public abstract class LocalPaginatedClusterAbstract {
       ORawBuffer rawBuffer = paginatedCluster.readRecord(entry.getKey(), false);
       Assert.assertNotNull(rawBuffer);
 
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
 
       if (updatedPositions.contains(entry.getKey())) {
         Assert.assertEquals(rawBuffer.version, newRecordVersion);
@@ -1299,7 +1343,7 @@ public abstract class LocalPaginatedClusterAbstract {
     for (Map.Entry<Long, byte[]> entry : positionRecordMap.entrySet()) {
       ORawBuffer rawBuffer = paginatedCluster.readRecord(entry.getKey(), false);
       Assert.assertNotNull(rawBuffer);
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
 
       if (updatedPositions.contains(entry.getKey())) {
         Assert.assertEquals(rawBuffer.version, newRecordVersion);
@@ -1385,7 +1429,7 @@ public abstract class LocalPaginatedClusterAbstract {
       ORawBuffer rawBuffer = paginatedCluster.readRecord(entry.getKey(), false);
       Assert.assertNotNull(rawBuffer);
 
-      Assertions.assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
+      assertThat(rawBuffer.buffer).isEqualTo(entry.getValue());
       if (updatedPositions.contains(entry.getKey())) {
         Assert.assertEquals(rawBuffer.version, newRecordVersion);
         Assert.assertEquals(rawBuffer.recordType, 3);
