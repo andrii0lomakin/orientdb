@@ -213,12 +213,12 @@ public abstract class LocalPaginatedClusterAbstract {
             physicalPosition[0] =
                 paginatedCluster.createRecord(
                     mediumRecord, recordVersion, (byte) 1, null, atomicOperation);
-//            throw new RollbackException();
+            throw new RollbackException();
           });
     } catch (RollbackException ignore) {
     }
 
-//    Assert.assertEquals(0, paginatedCluster.getEntries());
+    Assert.assertEquals(0, paginatedCluster.getEntries());
     Assert.assertNull(paginatedCluster.readRecord(physicalPosition[0].clusterPosition, false));
 
     atomicOperationsManager.executeInsideAtomicOperation(

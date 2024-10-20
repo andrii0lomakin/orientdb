@@ -32,6 +32,7 @@ import com.orientechnologies.orient.core.exception.OPaginatedClusterException;
 import com.orientechnologies.orient.core.exception.ORecordNotFoundException;
 import com.orientechnologies.orient.core.id.ORecordId;
 import com.orientechnologies.orient.core.metadata.OMetadataInternal;
+import com.orientechnologies.orient.core.storage.OCluster;
 import com.orientechnologies.orient.core.storage.OPhysicalPosition;
 import com.orientechnologies.orient.core.storage.ORawBuffer;
 import com.orientechnologies.orient.core.storage.OStorage;
@@ -341,21 +342,21 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       byte recordType,
       OPhysicalPosition allocatedPosition,
       OAtomicOperation atomicOperation) {
-//    return createRecord(
-//        new ByteArrayInputStream(content),
-//        recordVersion,
-//        recordType,
-//        allocatedPosition,
-//        atomicOperation
-//    );
-    return createRecordFromBytes(
-        content,
-        content.length,
+    return createRecord(
+        new ByteArrayInputStream(content),
         recordVersion,
         recordType,
         allocatedPosition,
         atomicOperation
     );
+//    return createRecordFromBytes(
+//        content,
+//        content.length,
+//        recordVersion,
+//        recordType,
+//        allocatedPosition,
+//        atomicOperation
+//    );
   }
 
   private OPhysicalPosition createRecordFromBytes(
@@ -533,16 +534,22 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
     assert source.hasContent();
 
     OClusterPage pendingPage = null;
+    OClusterPage firstPage = null;
     int pendingPagePosition = -1;
     int pendingPageOffset = -1;
     int pendingPageBytes = -1;
+    boolean pendingPageIsFirst = true;
 
     int firstPageIndex = -1;
     int firstPageOffset = -1;
+    int firstPagePosition = -1;
 
-    int contentSize = -calculateClusterEntrySize(0);
+    int contentSize = 0;
+
+    final int clusterEntrySize = calculateClusterEntrySize(0);
 
     while (source.hasContent()) {
+      final boolean isFirstEntry = pendingPage == null;
       final int nextPagePosition;
       final int nextPageOffset;
       final int nextPageBytes;
@@ -550,37 +557,42 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       final OClusterPage nextPage;
 
       // 1. checking the next page
-      final int availableContentSize = source.availableBytes(
-          pendingPage == null ? 0 : pendingPageBytes,
-          MAX_ENTRY_SIZE
-      );
+      final int availableContentSize =
+          isFirstEntry ?
+              source.availableBytes(0, MAX_ENTRY_SIZE - clusterEntrySize) :
+              source.availableBytes(pendingPageBytes, MAX_ENTRY_SIZE);
 
       if (availableContentSize > 0) {
-        // todo: handle case when availableContentSize is 0, but cluster entry metadata is not written yet
-        final int requiredEntrySpace = calculateClusterEntrySize(availableContentSize);
+        final int requiredEntrySpace =
+            isFirstEntry ? availableContentSize + clusterEntrySize : availableContentSize;
         nextPage = pageSupplier.apply(requiredEntrySpace);
         assert nextPage != null;
 
+
         final int availableInPage = nextPage.getMaxRecordSize() - MIN_ENTRY_SIZE;
+        // todo: what if isFirstEntry == true && availableInPage < BYTE_SIZE + INT_SIZE?
         if (availableInPage > 0) {
-          nextPageBytes = Math.min(availableInPage, requiredEntrySpace);
+          final var bytesToWrite = Math.min(availableInPage, requiredEntrySpace);
+          nextPageBytes = isFirstEntry ? bytesToWrite - clusterEntrySize : bytesToWrite;
 
           final int[] recPosPair = nextPage.findRecordPosition(
               recordVersion,
-              calculateChunkSize(nextPageBytes),
+              calculateChunkSize(bytesToWrite),
               -1,
               atomicOperation.getBookedRecordPositions(id, nextPage.getCacheEntry().getPageIndex())
           );
+
           nextPagePosition = recPosPair[0];
           nextPageIndex = nextPage.getCacheEntry().getPageIndex();
           nextPageOffset = recPosPair[1];
           assert nextPageOffset >= 0;
 
-          if (firstPageIndex < 0) {
+          if (firstPage == null) {
+            firstPage = nextPage;
             firstPageIndex = nextPageIndex;
             firstPageOffset = nextPageOffset;
+            firstPagePosition = nextPagePosition;
           }
-
         } else {
 
           // todo: test this part carefully.
@@ -598,12 +610,14 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       // 2. serializing the previous page
       if (pendingPage != null) {
         contentSize += pendingPageBytes;
+        final var bytesToWrite =
+            pendingPageIsFirst ? pendingPageBytes + clusterEntrySize : pendingPageBytes;
         final ORawPairObjectInteger<byte[]> pair =
             serializeEntryChunk(
                 source.get(),
                 contentSize,
-                calculateChunkSize(pendingPageBytes),
-                calculateClusterEntrySize(source.availableBytes(0, MAX_ENTRY_SIZE)),
+                calculateChunkSize(bytesToWrite),
+                calculateClusterEntrySize(pendingPageBytes), // todo: very unclear logic.
                 nextPage == null ? nextRecordPointer
                     : createPagePointer(nextPageIndex, nextPageOffset),
                 recordType
@@ -615,10 +629,13 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
         pendingPage.writeEntry(chunk, pendingPagePosition, chuckSize, pendingPageOffset);
 
         // this is not wrapped in try-finally now, is it ok?
-        pagePostProcessor.accept(pendingPage);
+        if (!pendingPageIsFirst) {
+          pagePostProcessor.accept(pendingPage);
+        }
 
         source.advance(pendingPageBytes);
 
+        pendingPageIsFirst = false;
         // todo: validate this:
         freeSpaceMap.updatePageFreeSpace(
             atomicOperation,
@@ -632,6 +649,10 @@ public final class OPaginatedClusterV2 extends OPaginatedCluster {
       pendingPageOffset = nextPageOffset;
       pendingPageBytes = nextPageBytes;
     }
+
+    assert firstPage != null;
+    firstPage.setRecordEntrySize(firstPagePosition + 3 * OIntegerSerializer.INT_SIZE + 1, contentSize);
+    pagePostProcessor.accept(firstPage);
 
     return new int[]{firstPageIndex, firstPageOffset, contentSize};
   }
