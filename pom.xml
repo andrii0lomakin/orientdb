@@ -92,7 +92,7 @@
         <javaassist.version>3.30.2-GA</javaassist.version>
         <jaxb.api.version>2.3.0</jaxb.api.version>
         <project.rootdir>${project.basedir}/</project.rootdir>
-        <graalvm.version>21.3.11</graalvm.version>
+        <graalvm.version>21.3.12</graalvm.version>
         <slf4j.version>2.0.16</slf4j.version>
         <slf4j.version>2.0.16</slf4j.version>
         <toolchain.jdk.version>[17,22)</toolchain.jdk.version>
