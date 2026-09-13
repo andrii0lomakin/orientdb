@@ -1,0 +1,42 @@
+name: Test shard configuration checker unit tests
+
+# Run when the checker or its tests change.
+# The checker guards the nightly Windows shard arguments against drift in core/pom.xml, so a
+# regression in it would let that drift through unnoticed.
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - '.github/scripts/verify-test-shards.py'
+      - '.github/scripts/verify-test-shards-test.py'
+      - '.github/workflows/verify-test-shards-tests.yml'
+  pull_request:
+    paths:
+      - '.github/scripts/verify-test-shards.py'
+      - '.github/scripts/verify-test-shards-test.py'
+      - '.github/workflows/verify-test-shards-tests.yml'
+  # Allow manual runs after a transient GitHub Actions outage.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Run unit tests
+        run: python3 .github/scripts/verify-test-shards-test.py
+
+      # The checker must also agree with the pom that is actually in the tree, not only with
+      # the fixtures in its tests.
+      - name: Check the real core/pom.xml
+        run: python3 .github/scripts/verify-test-shards.py

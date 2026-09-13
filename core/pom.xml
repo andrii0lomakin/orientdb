@@ -209,7 +209,8 @@
 
     <!--
       Compliance executions: one per TinkerPop suite-wrapper class (YTDBProcessTest,
-      YTDBStructureTest, YTDBGraphFeatureTest). Each wrapper carries
+      YTDBStandardOrderSemanticsProcessTest, YTDBStructureTest, YTDBGraphFeatureTest,
+      YTDBStandardOrderSemanticsFeatureTest). Each wrapper carries
       @Category(SequentialTest.class), but running it under any execution that configures a
       <groups>/<excludedGroups> filter (like sequential-tests above) silently executes ZERO
       tests: GroupMatcherCategoryFilter resolves @Category per leaf Description, not per class,
@@ -221,32 +222,40 @@
       runtime category filter, so no leaf is pruned. Do NOT "helpfully" re-add a <groups> or
       <excludedGroups> filter to these executions later; it will silently bring back the
       zero-tests bug. Each wrapper gets its own execution (rather than one execution listing all
-      three) so that <failIfNoTests>true</failIfNoTests> is scoped per wrapper: if any single
+      five) so that <failIfNoTests>true</failIfNoTests> is scoped per wrapper: if any single
       suite ever regresses to zero tests again, its own execution fails the build instead of
-      being masked by the other two still reporting tests. It also gives each suite its own
+      being masked by the others still reporting tests. It also gives each suite its own
       fork, which is the configuration that was performance-measured.
 
-      These three executions live in their own profile, activated on the ABSENCE of the `test`
-      user property, rather than as bare executions on the maven-surefire-plugin declaration
-      below. Reason: surefire discards EVERY execution's configured includes/excludes the moment
-      -Dtest= is supplied on the command line (AbstractSurefireMojo#isSpecificTestSpecified() in
-      the surefire sources); each execution then tries to run whatever -Dtest= names instead of
-      its own includes. Left as bare executions that would mean: (a) an ordinary
-      `-Dtest=SomeTest` core build runs SomeTest in four forks instead of one, once per
+      These five executions live in two profiles of their own, activated on the ABSENCE of the
+      `test` user property, rather than as bare executions on the maven-surefire-plugin
+      declaration below. Reason: surefire discards EVERY execution's configured
+      includes/excludes the moment -Dtest= is supplied on the command line
+      (AbstractSurefireMojo#isSpecificTestSpecified() in the surefire sources); each execution
+      then tries to run whatever -Dtest= names instead of its own includes. Left as bare
+      executions that would mean: (a) an ordinary `-Dtest=SomeTest` core build runs SomeTest
+      in six forks instead of one, once per
       compliance execution plus whichever execution it would normally belong to; and (b) a
       `-Dtest=SomeUnrelatedTest` build that matches nothing in this module hard-fails here
       anyway, via failIfNoSpecifiedTests (default true): once -Dtest= is set,
       AbstractSurefireMojo#getEffectiveFailIfNoTests() consults only that flag, never
       failIfNoTests, so the <failIfNoTests>true</failIfNoTests> below is not what triggers it.
       The -Dtest= builds run by .github/workflows/ci-failure-fix-agent.yml are real instances of
-      this pattern. Deactivating the whole profile
-      whenever -Dtest is supplied removes these three executions from the reactor entirely for
-      such runs, restoring the pre-existing -Dtest= behavior, while an ordinary build (no
-      -Dtest) still activates the profile and runs all three suites with their failIfNoTests
-      guard intact.
+      this pattern. Deactivating both profiles whenever -Dtest is supplied removes these
+      executions from the reactor entirely for such runs, restoring the pre-existing -Dtest=
+      behavior, while an ordinary build (no -Dtest) still activates both profiles and runs all
+      five suites with their failIfNoTests guard intact.
+
+      The executions are spread over two profiles, split roughly by cost, so that the nightly
+      Windows legs can run them in separate jobs — see the shard-skip-core-unit-tests profile
+      below for why that split exists. Both profiles carry the same `!test` activation, so
+      every build that is not a -Dtest= build activates both and the five executions run
+      together exactly as they did when one profile held all of them. A new compliance
+      execution belongs in whichever of the two profiles keeps the measured cost closer to
+      even; adding it to either one puts it in exactly one nightly shard automatically.
     -->
     <profile>
-      <id>gremlin-compliance-suites</id>
+      <id>gremlin-compliance-process-suites</id>
       <activation>
         <property>
           <name>!test</name>
@@ -284,6 +293,25 @@
                   <failIfNoTests>true</failIfNoTests>
                 </configuration>
               </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+    <profile>
+      <id>gremlin-compliance-structure-suites</id>
+      <activation>
+        <property>
+          <name>!test</name>
+        </property>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <executions>
               <execution>
                 <id>gremlin-structure-compliance-tests</id>
                 <phase>test</phase>
@@ -328,6 +356,95 @@
                   </systemPropertyVariables>
                   <failIfNoTests>true</failIfNoTests>
                 </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+    <!--
+      Nightly Windows shard support. This module's test phase no longer fits inside GitHub's
+      unraisable 360-minute cap on a hosted Windows runner, so
+      .github/workflows/maven-integration-tests-pipeline.yml splits that leg into several jobs
+      along this module's surefire executions. The shard comment in that file is the canonical
+      account of why, and carries the measurements. This profile is how a shard that runs only
+      the compliance suites drops the rest of this module's tests.
+
+      Activating it rebinds default-test and sequential-tests to phase `none`, which unbinds
+      them: both executions stay declared, but no lifecycle phase invokes them. The
+      small-cache-it profile above unbinds the inherited failsafe execution the same way. A
+      shard drops the compliance suites instead by deactivating
+      gremlin-compliance-process-suites or gremlin-compliance-structure-suites with
+      `-P '!<profile-id>'`, which needs nothing declared here.
+
+      Unbinding is the deliberate choice here; -Dtest= and -Dsurefire.includesFile are not
+      used. Both replace every execution's own includes — see the note above the compliance
+      profiles for what that does to this module — and -Dtest= additionally deactivates those
+      profiles, dropping all five compliance suites from the build without a word. Unbinding
+      changes only which executions the lifecycle invokes; every execution that still runs
+      keeps the configuration it has in an ordinary build.
+
+      The split is exhaustive because default-test and sequential-tests both exclude
+      **/gremlintest/**, where all five compliance wrapper classes live, so the unit and
+      compliance sides share no test class. Unbinding works by execution id, so a surefire
+      execution added to this module's <build> in future would NOT be unbound here and would
+      run in every shard rather than none: the split errs towards running a test twice, never
+      towards dropping it.
+
+      <skipTests> is not the alternative it looks like either. Set at plugin level it
+      silences every execution of that plugin at once, so it cannot express "unit executions
+      off, compliance executions on", which is the whole point of a shard. Set per execution
+      it could express that, but it works by merging configuration into an execution that
+      still runs, where phase-unbinding removes the execution from the lifecycle outright and
+      matches what small-cache-it above already does. -Dmaven.test.skip would express even
+      less: it also stops test-compile, and the tests module depends on this module's test
+      classes, so they must be compiled in every shard.
+
+      Only .github/workflows/maven-integration-tests-pipeline.yml sets the property, so an
+      ordinary build is unaffected. The profile sets no <skipTests>, so -DskipTests keeps
+      working exactly as before.
+    -->
+    <profile>
+      <id>shard-skip-core-unit-tests</id>
+      <activation>
+        <property>
+          <name>youtrackdb.shard.skipCoreUnitTests</name>
+          <!-- Matched on the value, not merely on the property being present. Presence-only
+               activation would make -Dyoutrackdb.shard.skipCoreUnitTests=false skip the tests,
+               and it reads JVM system properties too, so MAVEN_OPTS or .mvn/jvm.config would
+               activate it as readily as this workflow's -D does. -->
+          <value>true</value>
+        </property>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>default-test</id>
+                <phase>none</phase>
+              </execution>
+              <execution>
+                <id>sequential-tests</id>
+                <phase>none</phase>
+              </execution>
+            </executions>
+          </plugin>
+          <!-- vmlens is the module's second test-running plugin: its `test` execution takes
+               the goal's default `test` phase and runs **/*MTTest.java under an interleaving
+               agent. Unbinding surefire alone left those three classes running in all four
+               shards, which the shard logs confirmed, so it is unbound here too and the
+               instrumented run happens once, in the core-unit shard. -->
+          <plugin>
+            <groupId>com.vmlens</groupId>
+            <artifactId>vmlens-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>test</id>
+                <phase>none</phase>
               </execution>
             </executions>
           </plugin>
@@ -468,10 +585,12 @@
             <configuration>
               <groups>com.jetbrains.youtrackdb.internal.SequentialTest</groups>
               <excludes>
-                <!-- The three TinkerPop compliance wrapper classes (YTDBProcessTest,
-                     YTDBStructureTest, YTDBGraphFeatureTest) live under gremlintest/**, and so
-                     do the roughly nine YTDB-authored scenario/suite classes they invoke via
-                     reflection (packages gremlintest.scenarios / gremlintest.suites). The other
+                <!-- The five TinkerPop compliance wrapper classes (YTDBProcessTest,
+                     YTDBStandardOrderSemanticsProcessTest, YTDBStructureTest,
+                     YTDBGraphFeatureTest, YTDBStandardOrderSemanticsFeatureTest) live under
+                     gremlintest/**, and so do the roughly nine YTDB-authored scenario/suite
+                     classes they invoke via reflection (packages gremlintest.scenarios /
+                     gremlintest.suites). The other
                      ~3,700-3,800 classes those wrappers exercise are upstream TinkerPop
                      compliance classes loaded from the gremlin-test JAR dependency; they are
                      never file-scanned from this project's own test-classes directory, so this
@@ -483,7 +602,8 @@
                      which is annotated with it), so GroupMatcherCategoryFilter would match them
                      a second time under this execution's <groups> filter, on top of the single
                      run they already get via the gremlin-*-compliance-tests executions (see the
-                     gremlin-compliance-suites profile below). -->
+                     gremlin-compliance-process-suites and gremlin-compliance-structure-suites
+                     profiles below). -->
                 <exclude>**/gremlintest/**</exclude>
                 <!-- Configuring ANY custom <excludes> here replaces surefire's default
                      excludes outright, silently disabling its built-in exclusion of

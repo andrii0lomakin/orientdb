@@ -265,21 +265,107 @@ jobs:
           check_name: Integration Tests Results (Linux ${{ matrix.arch }}, JDK ${{ matrix.java }} - ${{ matrix.distribution }})
 
   test-windows:
-    name: Windows x64 - JDK ${{ matrix.java }} - ${{ matrix.distribution }}
+    name: Windows x64 - JDK ${{ matrix.java }} - ${{ matrix.distribution }} (${{ matrix.shard.id }})
     needs: check-changes
     if: needs.check-changes.outputs.should_run == 'true'
     runs-on: windows-latest
+    # Job-level permissions REPLACE the broader workflow-level block (contents, packages,
+    # actions, checks: write) that other jobs in this file need. This job checks out the
+    # repository (contents: read) and publishes a test-result check run (checks: write);
+    # it writes no contents, no packages and no workflow runs. Scoping matters more since
+    # the shard split below: actions/checkout persists the token into .git/config for the
+    # length of the job, and the split takes that from 2 runners per night to 8.
+    permissions:
+      contents: read
+      checks: write
+    # GitHub caps a hosted-runner job at 360 minutes and the cap cannot be raised. That cap,
+    # not this setting, is why the suite is split across shards; the shard comment below is the
+    # canonical account of the split and carries the measurements. The test-linux leg escaped
+    # the same ceiling in #1177 by declaring timeout-minutes: 600, which works only because
+    # that leg is self-hosted.
+    #
+    # Declaring 300 buys two things over inheriting the 360 cap. The difference for
+    # diagnostics is categorical, not a matter of degree: reaching the 360 cap terminates the
+    # job, so no always()-gated step runs at all, whereas timeout-minutes cancels it and
+    # cancelled jobs still get GitHub's roughly five-minute window — the same window the
+    # test-linux diagnostics note describes. And 300 clears the longest shard's projected
+    # 170-230 minutes on Windows, so it should fire only on a genuine stall.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
         java: [ '21', '25' ]
         distribution: [ 'temurin' ]
+        # One Maven invocation of this suite does not fit in 360 minutes on a hosted Windows
+        # runner, so it is split along core's own surefire executions. Measured on Linux, where
+        # the whole invocation takes 37 minutes: core alone is 32 of those, so a split by Maven
+        # module cannot balance — core holds 1373 of the repository's ~1499 test classes.
+        #
+        # The shards are exhaustive and disjoint. core's default-test and sequential-tests
+        # executions both exclude **/gremlintest/**, where all five TinkerPop compliance wrapper
+        # classes live, so the unit and compliance sides share no test class. core's tests run
+        # only in the three `-pl core -am` shards; the modules shard unbinds every core test
+        # execution — both surefire's and vmlens's, which runs **/*MTTest.java in the same
+        # phase — and owns every other module's tests. So nothing runs twice beyond
+        # gremlin-annotations' two test classes, which every shard rebuilds: `-am` pulls them
+        # into the three core shards and the modules shard builds the full reactor.
+        #
+        # Measured Linux wall time per shard, against 37:06 for the unsplit invocation:
+        # core-unit 18:48, core-gremlin-process 12:24, core-gremlin-structure 6:42, modules
+        # 7:11. So the longest shard is 51 % of the unsplit run, and the four together cost
+        # 45:05, about 22 % more machine time than one invocation. That overhead is the reactor
+        # build each shard repeats: the modules shard rebuilds core without running its tests
+        # in 2:52, which is the floor no split can go below.
+        #
+        # core-unit is the shard to split next if this leg creeps back towards the cap, since
+        # nearly 16 of its 18:48 is test execution. Its two executions, default-test and
+        # sequential-tests, would separate along the same unbind mechanism. That should leave
+        # core-gremlin-process's 12:24 as the longest shard, though the figure is an estimate
+        # rather than a measurement: the two executions do not divide in proportion to their
+        # 19136 and 2230 test counts, because default-test runs four classes at a time
+        # (threadCountClasses=4) while sequential-tests is single-threaded by design.
+        #
+        # A surefire execution added to core later lands in whichever shard's profile holds it,
+        # and one added to core's <build> runs in every shard. Both directions run a test more
+        # often than needed rather than dropping it.
+        #
+        # The single quotes around each '!<profile-id>' are load-bearing, and so is passing
+        # mvn_args through ${{ }} interpolation rather than an env var. Written as a bare
+        # $MVN_ARGS the shell word-splits without removing quotes, so Maven would receive the
+        # literal text including the quote characters, match no profile id, and — because Maven
+        # only warns when a -P deactivation names an unknown profile — run the suites the shard
+        # was meant to skip. That failure is green, not red. Any move to env must use a bash
+        # array or eval "set -- $MVN_ARGS". This holds only while these stay workflow-authored
+        # literals: a shard argument ever derived from a workflow_dispatch input or an event
+        # payload must NOT be interpolated here, because that would be direct shell injection
+        # into a step whose env carries the Maven mirror password.
+        shard:
+          - id: core-unit
+            # core's default-test (19136 tests) and sequential-tests (2230 tests).
+            mvn_args: "-pl core -am -P '!gremlin-compliance-process-suites' -P '!gremlin-compliance-structure-suites'"
+          - id: core-gremlin-process
+            # The two TinkerPop process compliance suites, the costliest pair.
+            mvn_args: "-pl core -am -Dyoutrackdb.shard.skipCoreUnitTests=true -P '!gremlin-compliance-structure-suites'"
+          - id: core-gremlin-structure
+            # The structure suite plus both graph-feature suites (1930 scenarios each).
+            mvn_args: "-pl core -am -Dyoutrackdb.shard.skipCoreUnitTests=true -P '!gremlin-compliance-process-suites'"
+          - id: modules
+            # Full reactor with every core surefire execution unbound, so this shard runs the
+            # tests of server, tests, embedded, examples and jmh-ldbc. core still builds here
+            # because those modules depend on it.
+            mvn_args: "-Dyoutrackdb.shard.skipCoreUnitTests=true -P '!gremlin-compliance-process-suites' -P '!gremlin-compliance-structure-suites'"
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'develop' }}
           fetch-depth: 0
+          # This job runs no git operation after the checkout, so the token does not need to
+          # sit in .git/config for the length of a multi-hour test run that executes project
+          # code. maven-pipeline.yml's integration-tests job builds the same reactor the same
+          # way with this set. buildnumber-maven-plugin:create still works: at its default
+          # doCheck/doUpdate it reads local git plumbing and contacts no remote.
+          persist-credentials: false
 
       - name: Set up JDK ${{ matrix.java }}
         uses: actions/setup-java@v5
@@ -296,10 +382,22 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Shard membership rests on two things in core/pom.xml, and both fail silently when it
+      # drifts: the compliance profile ids a shard deactivates with -P '!<id>' (Maven only
+      # warns when that names a profile which does not exist), and the execution ids the
+      # shard-skip-core-unit-tests profile rebinds to phase none (a renamed execution makes
+      # the entry merge as a new one instead of unbinding the real one). The second case was
+      # live for the vmlens plugin until review caught it. Neither loses coverage, but both
+      # run a suite in shards meant to skip it and cost a slow runner an extra hour.
+      - name: Verify Shard Configuration
+        shell: bash
+        run: >-
+          "${{ steps.python.outputs.python-path }}" .github/scripts/verify-test-shards.py
+
       - name: Run Maven Test
         id: tests
         shell: bash
-        run: ./mvnw -s .github/workflows/settings.xml clean package -B -Dmaven.test.failure.ignore=true -P ci-integration-tests
+        run: ./mvnw -s .github/workflows/settings.xml clean package -B -Dmaven.test.failure.ignore=true -P ci-integration-tests ${{ matrix.shard.mvn_args }}
         env:
           MAVEN_MIRROR_USERNAME: ${{ secrets.MAVEN_MIRROR_USERNAME }}
           MAVEN_MIRROR_PASSWORD: ${{ secrets.MAVEN_MIRROR_PASSWORD }}
@@ -318,18 +416,21 @@ jobs:
       - name: Upload Test Diagnostics
         uses: actions/upload-artifact@v7
         # always(), NOT !cancelled(): a timeout-killed job is reported as cancelled, which is
-        # precisely when these dumps are the only diagnostic left. This job declares no
-        # timeout-minutes and runs on a GitHub-hosted Windows runner, so the effective limit is
-        # the hosted 6-hour (360-minute) job cap.
+        # precisely when these dumps are the only diagnostic left. This job's
+        # timeout-minutes: 300 fires before GitHub's hosted 360-minute cap, which is what makes
+        # this step reachable at all on a stalled shard — see the timeout-minutes note on this
+        # job for why the two cases differ categorically.
         #
         # This leg runs `clean package -P ci-integration-tests`, so failsafe never executes;
         # the failsafe globs are deliberate future-proofing for a promotion to verify and match
         # nothing today (if-no-files-found: ignore makes them free).
         #
         # run_attempt in the name avoids the upload-artifact v4+ duplicate-name 409 on re-runs.
+        # The shard id is in the name for the same reason: the four shards of one JDK would
+        # otherwise upload under one name and 409.
         if: always()
         with:
-          name: test-diagnostics-integration-windows-jdk${{ matrix.java }}-${{ matrix.distribution }}-attempt${{ github.run_attempt }}
+          name: test-diagnostics-integration-windows-jdk${{ matrix.java }}-${{ matrix.distribution }}-${{ matrix.shard.id }}-attempt${{ github.run_attempt }}
           path: |
             **/target/deadlock-report.txt
             **/target/surefire-reports/*.dumpstream
@@ -349,7 +450,7 @@ jobs:
           large_files: true
           comment_mode: off
           compare_to_earlier_commit: false
-          check_name: Integration Tests Results (Windows x64, JDK ${{ matrix.java }} - ${{ matrix.distribution }})
+          check_name: Integration Tests Results (Windows x64, JDK ${{ matrix.java }} - ${{ matrix.distribution }}, ${{ matrix.shard.id }})
 
   merge-to-main:
     name: Merge develop into main
@@ -538,6 +639,16 @@ jobs:
   notify-failure:
     name: Notify build failure on Zulip
     needs: [ test-linux, test-windows, merge-to-main, deploy ]
+    # The two `cancelled` arms exist because a job killed by timeout-minutes reports
+    # `cancelled`, not `failure`. Without them this job stayed silent on exactly that path:
+    # in run 566 the Windows JDK 21 timeout was the only fault in the run, and this job was
+    # skipped, so nobody was paged and no fix agent was dispatched.
+    #
+    # always() is kept rather than !cancelled(). Run 566's run-level conclusion was itself
+    # `cancelled`, so it cannot be assumed that cancelled() is false on the very path these
+    # arms are here to catch, and guessing wrong would restore the silence. The cost is that a
+    # run cancelled by a superseding manual dispatch, or by hand, also pages; the message
+    # below prints each leg's result so that page explains itself.
     if: >-
       always() &&
       github.event_name != 'workflow_dispatch' &&
@@ -545,7 +656,9 @@ jobs:
         needs.test-linux.result == 'failure' ||
         needs.test-windows.result == 'failure' ||
         needs.merge-to-main.result == 'failure' ||
-        needs.deploy.result == 'failure'
+        needs.deploy.result == 'failure' ||
+        needs.test-linux.result == 'cancelled' ||
+        needs.test-windows.result == 'cancelled'
       )
     runs-on: ubuntu-latest
     # Job-level permissions REPLACE the broader workflow-level block (contents,
@@ -555,7 +668,15 @@ jobs:
     permissions:
       actions: write
     steps:
+      # Deliberately still gated on `failure` only, while the job's own condition also
+      # covers `cancelled`. Two reasons not to widen it: ci-failure-fix-agent.yml mints an App
+      # token with contents and workflows write, so auto-dispatching it on a timeout would
+      # widen what a stalled job can set in motion; and that workflow gathers its context by
+      # selecting jobs with `.conclusion == "failure"`, so a dispatch after a timeout would
+      # hand the agent empty logs. A cancelled leg therefore pages a human instead, and the
+      # message below says so rather than claiming an agent is on it.
       - name: Dispatch CI Fix Agent
+        id: dispatch
         if: >-
           needs.test-linux.result == 'failure' ||
           needs.test-windows.result == 'failure'
@@ -567,7 +688,12 @@ jobs:
             -f failed_run_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             -f failed_workflow_name="${{ github.workflow }}" \
             -f trigger_sha="${{ github.sha }}"
+      # always() because this step inherits an implicit success() otherwise: a dispatch that
+      # runs and fails would abort the job here and send nothing, which is the same silence
+      # the cancelled arms above exist to remove, reached another way. The dispatch step keeps
+      # its own failure, so a broken dispatch still shows up as a failed job.
       - name: Send Zulip Notification
+        if: always()
         uses: zulip/github-actions-zulip/send-message@v2
         with:
           api-key: ${{ secrets.ZULIP_API_KEY }}
@@ -579,8 +705,13 @@ jobs:
           content: |
             **BUILD FAILED** :rotating_light:
             Integration tests or merge failed on branch `${{ github.ref_name }}` for commit ${{ github.sha }} for repo ${{ github.repository }}.
+            Legs: test-linux `${{ needs.test-linux.result }}`, test-windows `${{ needs.test-windows.result }}`, merge-to-main `${{ needs.merge-to-main.result }}`, deploy `${{ needs.deploy.result }}`.
             [View Run Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            :robot: Automated fix agent has been dispatched and is investigating...
+            ${{ steps.dispatch.outcome == 'success'
+                && ':robot: Automated fix agent has been dispatched and is investigating...'
+                || (steps.dispatch.outcome == 'skipped'
+                    && ':warning: No fix agent dispatched, because no leg reported `failure`. A leg was cancelled instead, most often by its own timeout-minutes or by a superseding run. Inspect the run manually.'
+                    || ':rotating_light: A leg reported `failure`, but dispatching the fix agent failed. No agent is investigating. Inspect the run manually.') }}
 
   notify-youtrack-failure:
     name: Notify YouTrack sync failure on Zulip

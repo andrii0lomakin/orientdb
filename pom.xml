@@ -1072,8 +1072,9 @@
                 <!-- Use prepare-package (not test) so the report runs AFTER all
                      surefire executions. The core module binds multiple surefire
                      executions to the test phase: default-test, sequential-tests, and
-                     (on an ordinary build, no -Dtest=) the three per-wrapper Gremlin
-                     TinkerPop compliance executions. Binding report to test would run
+                     (on an ordinary build, no -Dtest=) the five per-wrapper Gremlin
+                     TinkerPop compliance executions, which live in the two
+                     gremlin-compliance-* profiles. Binding report to test would run
                      it between them, missing coverage from whichever executions run
                      later in that phase. -->
                 <phase>prepare-package</phase>
