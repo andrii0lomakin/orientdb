@@ -113,7 +113,7 @@
     <toolchain.jdk.version>[21,)</toolchain.jdk.version>
     <gremlin.version>3.8.1-e3acec5-SNAPSHOT</gremlin.version>
     <hamcrest.version>3.0</hamcrest.version>
-    <cucumber.version>7.34.4</cucumber.version>
+    <cucumber.version>7.34.8</cucumber.version>
     <docker.platforms>linux/amd64,linux/arm64/v8</docker.platforms>
     <guice.version>7.0.0</guice.version>
     <antlr.version>4.13.2</antlr.version>
