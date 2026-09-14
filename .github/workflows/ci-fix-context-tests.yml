@@ -1,0 +1,60 @@
+name: CI fix agent context unit tests
+
+# Run on every change that could affect the fix agent's failure-context
+# pre-fetch. That pre-fetch runs once per agent dispatch, on a self-hosted
+# runner, and is the agent's only source of truth about the failure it was sent
+# to fix — so a regression in it does not announce itself, it just produces a
+# report written from no evidence. This job exercises the shell block against a
+# stub gh on the PR, before that can happen.
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - '.github/workflows/ci-failure-fix-agent.yml'
+      - '.github/scripts/ci-fix-context-test.py'
+      - '.github/workflows/ci-fix-context-tests.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/ci-failure-fix-agent.yml'
+      - '.github/scripts/ci-fix-context-test.py'
+      - '.github/workflows/ci-fix-context-tests.yml'
+  # Allow manual re-runs (e.g. after a transient GitHub Actions outage)
+  # without having to push an empty commit.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    # ubuntu-latest deliberately: this job executes a shell block extracted
+    # from a workflow file in the PR's own tree, so it must stay on an
+    # ephemeral GitHub-hosted runner and never move to the self-hosted pool.
+    runs-on: ubuntu-latest
+    # The suite runs in well under a minute. The headroom is for its own
+    # per-subprocess timeouts: roughly 70 shell executions at 30s each is a
+    # ~35-minute worst case, and a hang should be reported by the script,
+    # naming the scenario, rather than killed opaquely by the job.
+    timeout-minutes: 45
+    steps:
+      # The tests read the workflow file out of the working tree and execute
+      # the shell block they find there, so a normal (shallow) checkout is
+      # enough; nothing consults history.
+      - uses: actions/checkout@v7
+        with:
+          # This job runs PR-authored shell by design, so the ambient token
+          # does not stay in .git/config while it does. Matches the checkout in
+          # ci-failure-fix-agent.yml and pr-integration-tests.yml.
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Run unit tests
+        # The tests put a stub `gh` first on PATH, so the real GitHub CLI that
+        # ubuntu-latest ships is never called and no token is needed. Only `gh`
+        # is stubbed: the extracted block calls `jq` directly and uses the
+        # runner's real one, which ubuntu-latest provides.
+        run: python3 .github/scripts/ci-fix-context-test.py

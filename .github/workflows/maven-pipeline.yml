@@ -1101,6 +1101,17 @@ jobs:
       - name: Validate workflow TOC + annotations
         run: python3 .claude/scripts/workflow-reindex.py --check
 
+      # Folded in for the same reason as the TOC check above: the standalone
+      # `ci-fix-context-tests.yml` is path-filtered and advisory, so a red
+      # gather-block test there cannot block a merge. The CI fix agent's
+      # pre-fetch runs once per dispatch on a self-hosted runner and is the
+      # agent's only source of truth about the failure it was sent to fix, so a
+      # regression in it surfaces as a confident report written from no
+      # evidence. The suite is stdlib-only, stubs `gh`, needs no token, and
+      # finishes in ~5s.
+      - name: Validate CI fix agent context pre-fetch
+        run: python3 .github/scripts/ci-fix-context-test.py
+
       - name: Check results
         env:
           DETECT_RESULT: ${{ needs.detect-changes.result }}
