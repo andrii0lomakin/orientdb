@@ -82,20 +82,22 @@ public final class YTDBTransaction extends AbstractTransaction {
     return result;
   }
 
+  // Commit-time exceptions (e.g. ConcurrentModificationException from MVCC) are
+  // rethrown so callers can react — retry, surface an error, etc. Rollback
+  // failures are logged and swallowed: when the body throws, its exception is
+  // what the caller needs to see, and rethrowing a secondary rollback failure
+  // from the finally block would mask it.
   private static void finishTx(boolean ok, Transaction tx) {
-    if (tx.isOpen()) {
-      if (ok) {
-        try {
-          tx.commit();
-        } catch (Exception e) {
-          logger.error("Failed to commit transaction", e);
-        }
-      } else {
-        try {
-          tx.rollback();
-        } catch (Exception e) {
-          logger.error("Failed to rollback transaction", e);
-        }
+    if (!tx.isOpen()) {
+      return;
+    }
+    if (ok) {
+      tx.commit();
+    } else {
+      try {
+        tx.rollback();
+      } catch (Exception e) {
+        logger.error("Failed to rollback transaction", e);
       }
     }
   }
