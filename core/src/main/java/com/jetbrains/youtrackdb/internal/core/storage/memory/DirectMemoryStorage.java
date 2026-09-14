@@ -27,6 +27,7 @@ import com.jetbrains.youtrackdb.internal.core.db.YouTrackDBInternalEmbedded;
 import com.jetbrains.youtrackdb.internal.core.db.record.record.RID;
 import com.jetbrains.youtrackdb.internal.core.engine.memory.EngineMemory;
 import com.jetbrains.youtrackdb.internal.core.id.RecordIdInternal;
+import com.jetbrains.youtrackdb.internal.core.storage.disk.PreparedBackupChain;
 import com.jetbrains.youtrackdb.internal.core.storage.impl.local.AbstractStorage;
 import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.wal.LogSequenceNumber;
 import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.wal.MemoryWriteAheadLog;
@@ -100,7 +101,6 @@ public class DirectMemoryStorage extends AbstractStorage {
     throw new UnsupportedOperationException("Backup is not supported for memory storage");
   }
 
-
   @Override
   public String backup(Supplier<Iterator<String>> ibuFilesSupplier,
       Function<String, InputStream> ibuInputStreamSupplier,
@@ -120,6 +120,10 @@ public class DirectMemoryStorage extends AbstractStorage {
     throw new UnsupportedOperationException("Backup is not supported for memory storage");
   }
 
+  @Override
+  public void restoreFromPreparedBackupChain(PreparedBackupChain chain) {
+    throw new UnsupportedOperationException("Backup is not supported for memory storage");
+  }
 
   @Override
   public boolean exists() {
@@ -173,21 +177,18 @@ public class DirectMemoryStorage extends AbstractStorage {
   protected void initIv() {
   }
 
-  @Nullable
-  @Override
+  @Nullable @Override
   protected LogSequenceNumber copyWALToBackup(
       final ZipOutputStream zipOutputStream, final long startSegment) {
     return null;
   }
 
-  @Nullable
-  @Override
+  @Nullable @Override
   protected File createWalTempDirectory() {
     return null;
   }
 
-  @Nullable
-  @Override
+  @Nullable @Override
   protected WriteAheadLog createWalFromIBUFiles(
       final File directory,
       final ContextConfiguration contextConfiguration,

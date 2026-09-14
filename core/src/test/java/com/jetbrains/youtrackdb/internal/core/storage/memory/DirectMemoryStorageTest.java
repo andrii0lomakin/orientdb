@@ -216,6 +216,18 @@ public class DirectMemoryStorageTest {
         null));
   }
 
+  /**
+   * Verifies that {@code restoreFromPreparedBackupChain(PreparedBackupChain)} throws
+   * {@link UnsupportedOperationException}.
+   *
+   * <p>A memory storage supports no backup at all, so a memory storage replays no prepared backup
+   * chain either.
+   */
+  @Test(expected = UnsupportedOperationException.class)
+  public void testRestoreFromPreparedBackupChainThrows() throws Exception {
+    withMemoryStorage(storage -> storage.restoreFromPreparedBackupChain(null));
+  }
+
   // ---------------------------------------------------------------------------
   // Protected stub methods (readIv / getIv / initIv / copyWALToBackup /
   // createWalTempDirectory / createWalFromIBUFiles) — accessed via reflection

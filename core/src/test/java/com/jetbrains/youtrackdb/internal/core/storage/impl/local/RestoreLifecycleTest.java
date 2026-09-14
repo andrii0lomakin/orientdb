@@ -65,6 +65,7 @@ public class RestoreLifecycleTest {
   private static final String PASSWORD = "adminpwd";
   private static final String RECORD_CLASS = "RestoredClass";
   private static final String SOURCE = "restoreSource";
+  private static final String UNUSABLE_SOURCE = "unusableRestoreSource";
   private static final String TARGET = "restoreTarget";
   private static final FeatureFormatIdentity FEATURE_FORMAT = new FeatureFormatIdentity(1);
 
@@ -72,6 +73,8 @@ public class RestoreLifecycleTest {
   private Path databasesPath;
   private Path backupPath;
   private Path emptyBackupPath;
+  private Path unusableBackupPath;
+  private boolean unusableBackupCreated;
 
   @Before
   public void createDirectories() throws Exception {
@@ -79,6 +82,7 @@ public class RestoreLifecycleTest {
     databasesPath = Files.createDirectories(root.resolve("databases"));
     backupPath = Files.createDirectories(root.resolve("backup"));
     emptyBackupPath = Files.createDirectories(root.resolve("empty-backup"));
+    unusableBackupPath = Files.createDirectories(root.resolve("unusable-backup"));
   }
 
   @After
@@ -87,37 +91,37 @@ public class RestoreLifecycleTest {
   }
 
   /**
-   * The restore target carries the restore-in-progress state before any content write.
+   * No restore target exists while the restore reads its source, and the finished target is
+   * active.
    *
-   * <p>The scenario probes the admission reason of the target from inside the read of every backup
-   * file. The expected outcome has three parts. Every probe before the content copy reports the
-   * interrupted-restore reason, which proves the restore-in-progress lifecycle state. The finished
-   * restore leaves an accepted image, which proves the active lifecycle state. The restored
-   * database opens and carries the content of the backup.
+   * <p>The restore prepares and validates the complete backup chain before any change of the
+   * target. The scenario probes the target directory from inside the read of every backup file.
+   * The expected outcome has three parts. No probe sees a target directory, which proves that
+   * every source read precedes the target creation. The finished restore leaves an accepted image,
+   * which proves the active lifecycle state. The restored database opens and carries the content
+   * of the backup.
    */
   @Test
-  public void restoreTargetCarriesRestoreStateBeforeContentAndActiveStateAfterward()
+  public void restoreCreatesNoTargetBeforeSourceValidationAndActivatesAfterward()
       throws Exception {
     createSourceDatabaseAndBackup();
-    var observedReasons = new ArrayList<StorageAdmissionException.Reason>();
+    var observedTargets = new ArrayList<Boolean>();
 
     try (var youTrackDB = openManager()) {
       internalOf(youTrackDB).restore(
           TARGET,
           this::backupFileNames,
           fileName -> {
-            observedReasons.add(admissionReasonOf(TARGET));
+            observedTargets.add(Files.exists(databasesPath.resolve(TARGET)));
             return openBackupFile(fileName);
           },
           null,
           null);
 
-      assertFalse("the restore must read at least one backup file", observedReasons.isEmpty());
-      for (var reason : observedReasons) {
-        assertEquals(
-            "the target must carry the restore-in-progress state before the content copy",
-            StorageAdmissionException.Reason.INTERRUPTED_RESTORE,
-            reason);
+      assertFalse("the restore must read at least one backup file", observedTargets.isEmpty());
+      for (var targetExists : observedTargets) {
+        assertFalse(
+            "no source read may follow the creation of the restore target", targetExists);
       }
       assertNull(
           "the finished restore must publish the active lifecycle state",
@@ -133,19 +137,77 @@ public class RestoreLifecycleTest {
   }
 
   /**
-   * A restore without any backup content leaves a target in the restore-in-progress state.
+   * A restore without any backup content creates no target at all.
    *
-   * <p>The scenario restores from an empty backup directory, which interrupts the restore before
-   * the first content write. The expected outcome has three parts. The restore reports a failure.
-   * The target stays visible and reports the interrupted-restore reason. An open of the target
-   * repeats that same rejection.
+   * <p>The chain validation of the restore refuses an empty source before any target change. The
+   * scenario restores from an empty backup directory. The expected outcome has two parts. The
+   * restore reports a failure. No database and no directory of the target name exist afterwards.
    */
   @Test
-  public void restoreWithoutBackupContentLeavesRestoreInProgressTarget() throws Exception {
+  public void restoreWithoutBackupContentCreatesNoTarget() throws Exception {
     try (var youTrackDB = openManager()) {
       assertThrows(
           RuntimeException.class,
           () -> internalOf(youTrackDB).restore(TARGET, emptyBackupPath.toString(), null, null));
+
+      assertFalse("the refused restore must create no database", youTrackDB.exists(TARGET));
+    }
+    assertFalse(
+        "the refused restore must create no directory",
+        Files.exists(databasesPath.resolve(TARGET)));
+  }
+
+  /**
+   * A restore of a truncated source creates no target at all.
+   *
+   * <p>A truncated unit holds no valid hash code, so the chain validation refuses that unit before
+   * any target change. The scenario truncates the stream of every backup file. The expected
+   * outcome has two parts. The restore reports a failure. No directory of the target name exists
+   * afterwards.
+   */
+  @Test
+  public void restoreOfTruncatedSourceCreatesNoTarget() throws Exception {
+    createSourceDatabaseAndBackup();
+
+    try (var youTrackDB = openManager()) {
+      assertThrows(
+          RuntimeException.class,
+          () -> internalOf(youTrackDB).restore(
+              TARGET,
+              this::backupFileNames,
+              this::openTruncatedBackupFile,
+              null,
+              null));
+
+      assertFalse("the refused restore must create no database", youTrackDB.exists(TARGET));
+    }
+    assertFalse(
+        "the refused restore must create no directory",
+        Files.exists(databasesPath.resolve(TARGET)));
+  }
+
+  /**
+   * A failure inside the replay leaves the target in the restore-in-progress state.
+   *
+   * <p>The scenario restores one admitted chain whose content carries an unsupported storage
+   * layout version. The chain passes admission, so the replay starts and then fails.
+   *
+   * <p>The expected outcome has four parts. The restore reports a failure. The target stays
+   * visible and reports the interrupted-restore reason. An open of the target repeats that same
+   * rejection. No temporary directory of the failed request survives, because the request owns
+   * its prepared copies until the request ends.
+   */
+  @Test
+  public void replayFailureLeavesRestoreInProgressTarget() throws Exception {
+    var temporaryDirectoriesBefore = temporaryChainDirectories();
+
+    try (var youTrackDB = openManager()) {
+      interruptRestoreOfTarget(youTrackDB);
+
+      assertEquals(
+          "the failed replay must remove every prepared copy",
+          temporaryDirectoriesBefore,
+          temporaryChainDirectories());
 
       assertTrue("the interrupted restore target must stay visible", youTrackDB.exists(TARGET));
       assertEquals(
@@ -160,44 +222,18 @@ public class RestoreLifecycleTest {
   }
 
   /**
-   * A restore interrupted inside the content read leaves a target in the restore-in-progress
-   * state.
+   * A backup of a database without a finished creation never reaches any target.
    *
-   * <p>The scenario truncates the stream of every backup file, which interrupts the restore during
-   * the content stage. The expected outcome has two parts. The restore reports a failure. The
-   * target reports the interrupted-restore reason.
+   * <p>The genesis marker is the durable property that records a finished genesis. Every backup
+   * header carries the creation completion evidence of its source database. The scenario clears
+   * that marker in the source database, takes a backup, and restores that backup.
+   *
+   * <p>The expected outcome has three parts. The restore names the missing creation completion
+   * evidence. No directory of the target name exists afterwards. The source database keeps every
+   * file.
    */
   @Test
-  public void restoreInterruptedInsideContentLeavesRestoreInProgressTarget() throws Exception {
-    createSourceDatabaseAndBackup();
-
-    try (var youTrackDB = openManager()) {
-      assertThrows(
-          RuntimeException.class,
-          () -> internalOf(youTrackDB).restore(
-              TARGET,
-              this::backupFileNames,
-              this::openTruncatedBackupFile,
-              null,
-              null));
-
-      assertEquals(
-          StorageAdmissionException.Reason.INTERRUPTED_RESTORE, admissionReasonOf(TARGET));
-    }
-  }
-
-  /**
-   * A backup without a set genesis marker never reaches the active lifecycle state.
-   *
-   * <p>The genesis marker is the durable property that records a finished genesis. The scenario
-   * clears that marker in the source database, takes a backup, and restores that backup. The
-   * content copy therefore succeeds and only the validation fails. The expected outcome has three
-   * parts. The restore names the missing genesis marker. The target reports the interrupted-restore
-   * reason, so no target reaches the active state before the validation passes. A drop discards
-   * the target and reports success.
-   */
-  @Test
-  public void restoreOfContentWithoutGenesisMarkerNeverReachesActiveState() throws Exception {
+  public void restoreOfBackupWithoutCreationEvidenceCreatesNoTarget() throws Exception {
     try (var youTrackDB = openManager()) {
       createSourceDatabase(youTrackDB);
       storageOf(youTrackDB, SOURCE).setProperty(SharedContext.GENESIS_COMPLETED_PROPERTY, "false");
@@ -211,16 +247,17 @@ public class RestoreLifecycleTest {
               () -> internalOf(youTrackDB).restore(TARGET, backupPath.toString(), null, null));
 
       assertTrue(
-          "the failure must name the missing genesis completion marker, saw: "
+          "the failure must name the missing creation completion evidence, saw: "
               + rootMessage(failure),
-          rootMessage(failure).contains("no genesis completion marker"));
-      assertEquals(
-          StorageAdmissionException.Reason.INTERRUPTED_RESTORE, admissionReasonOf(TARGET));
-
-      youTrackDB.drop(TARGET);
-      assertFalse("the drop must discard the interrupted restore target",
-          youTrackDB.exists(TARGET));
+          rootMessage(failure).contains("no accepted creation completion evidence"));
+      assertFalse("the refused restore must create no database", youTrackDB.exists(TARGET));
     }
+    assertFalse(
+        "the refused restore must create no directory",
+        Files.exists(databasesPath.resolve(TARGET)));
+    assertFalse(
+        "the source database must keep every file",
+        entryNames(databasesPath.resolve(SOURCE)).isEmpty());
   }
 
   /**
@@ -287,9 +324,7 @@ public class RestoreLifecycleTest {
     createSourceDatabaseAndBackup();
 
     try (var youTrackDB = openManager()) {
-      assertThrows(
-          RuntimeException.class,
-          () -> internalOf(youTrackDB).restore(TARGET, emptyBackupPath.toString(), null, null));
+      interruptRestoreOfTarget(youTrackDB);
 
       internalOf(youTrackDB).restartInterruptedRestore(TARGET, backupPath.toString(), null, null);
 
@@ -378,9 +413,7 @@ public class RestoreLifecycleTest {
     createSourceDatabaseAndBackup();
 
     try (var youTrackDB = openManager()) {
-      assertThrows(
-          RuntimeException.class,
-          () -> internalOf(youTrackDB).restore(TARGET, emptyBackupPath.toString(), null, null));
+      interruptRestoreOfTarget(youTrackDB);
     }
     deleteEveryEntryExceptTheAuthorityLockFile(databasesPath.resolve(TARGET));
 
@@ -579,19 +612,27 @@ public class RestoreLifecycleTest {
    * <p>The restart holds one exclusion over the deletion and over the new restore. A creation
    * that runs between the deletion and the new restore would leave an empty active database under
    * the name of the restore target. The scenario runs one restart while a second thread creates
-   * the same name in a loop. The expected outcome has two parts. The restart finishes. The
-   * database of that name carries the content of the backup, so no empty database survived.
+   * the same name in a loop.
+   *
+   * <p>The barrier of this test removes every vacuous pass. The restart starts only after the
+   * competitor finished its first attempt. The test also counts the attempts of the competitor
+   * during the restart, so a competitor that never ran fails this test.
+   *
+   * <p>The expected outcome has
+   * three parts. The restart finishes. The competitor attempts at least one creation during the
+   * restart. The database of that name carries the content of the backup, so no empty database
+   * survived.
    */
   @Test(timeout = 300_000)
   public void restartExcludesAConcurrentCreationOfTheSameName() throws Exception {
     createSourceDatabaseAndBackup();
 
     try (var youTrackDB = openManager()) {
-      assertThrows(
-          RuntimeException.class,
-          () -> internalOf(youTrackDB).restore(TARGET, emptyBackupPath.toString(), null, null));
+      interruptRestoreOfTarget(youTrackDB);
 
       var competitorRuns = new java.util.concurrent.atomic.AtomicBoolean(true);
+      var competitorAttempts = new AtomicInteger();
+      var firstAttemptFinished = new java.util.concurrent.CountDownLatch(1);
       var competitor =
           new Thread(
               () -> {
@@ -602,9 +643,16 @@ public class RestoreLifecycleTest {
                     // Every refusal of the competing creation is expected. Only the final state
                     // of the database decides this test.
                   }
+                  competitorAttempts.incrementAndGet();
+                  firstAttemptFinished.countDown();
                 }
               });
       competitor.start();
+      // The restart starts after the first attempt of the competitor, so the competitor is
+      // running when the exclusive part of the restart begins.
+      assertTrue("the competitor must reach its first attempt",
+          firstAttemptFinished.await(2, java.util.concurrent.TimeUnit.MINUTES));
+      var attemptsBeforeRestart = competitorAttempts.get();
       try {
         internalOf(youTrackDB).restartInterruptedRestore(TARGET, backupPath.toString(), null, null);
       } finally {
@@ -612,6 +660,9 @@ public class RestoreLifecycleTest {
         competitor.join();
       }
 
+      assertTrue(
+          "the competitor must attempt at least one creation during the restart",
+          competitorAttempts.get() > attemptsBeforeRestart);
       try (var session = youTrackDB.open(TARGET, ADMIN, PASSWORD)) {
         assertTrue(
             "no empty database may survive the restart",
@@ -708,9 +759,7 @@ public class RestoreLifecycleTest {
     createSourceDatabaseAndBackup();
 
     try (var youTrackDB = openManager()) {
-      assertThrows(
-          RuntimeException.class,
-          () -> internalOf(youTrackDB).restore(TARGET, emptyBackupPath.toString(), null, null));
+      interruptRestoreOfTarget(youTrackDB);
 
       // The public entry accepts an Apache configuration, which the embedded entry never sees.
       youTrackDB.restartInterruptedRestore(
@@ -739,9 +788,7 @@ public class RestoreLifecycleTest {
     createSourceDatabaseAndBackup();
 
     try (var youTrackDB = openManager()) {
-      assertThrows(
-          RuntimeException.class,
-          () -> internalOf(youTrackDB).restore(TARGET, emptyBackupPath.toString(), null, null));
+      interruptRestoreOfTarget(youTrackDB);
 
       youTrackDB.restartInterruptedRestore(TARGET, backupPath.toString(), null, null);
 
@@ -1142,6 +1189,46 @@ public class RestoreLifecycleTest {
     }
   }
 
+  /**
+   * Interrupts one restore of the target and leaves the restore-in-progress lifecycle state.
+   *
+   * <p>The prepared chain passes the admission of the restore. Every header of that chain carries
+   * the accepted database format and the accepted creation completion evidence. The replay then
+   * fails, because the content of that backup carries an unsupported storage layout version. The
+   * target therefore keeps every file and reports the interrupted-restore reason.
+   */
+  private void interruptRestoreOfTarget(YouTrackDBImpl youTrackDB) throws Exception {
+    createUnusableBackup(youTrackDB);
+
+    assertThrows(
+        RuntimeException.class,
+        () -> internalOf(youTrackDB).restore(TARGET, unusableBackupPath.toString(), null, null));
+    assertEquals(
+        "the interrupted restore must leave the restore-in-progress state",
+        StorageAdmissionException.Reason.INTERRUPTED_RESTORE,
+        admissionReasonOf(TARGET));
+  }
+
+  /**
+   * Creates one backup whose headers pass admission and whose content fails the replay.
+   *
+   * <p>The source database of that backup carries an unsupported storage layout version. The
+   * backup header records the layout version of this build, so the admission of a later restore
+   * accepts the chain. The configuration load of the replay then refuses the restored content.
+   */
+  private void createUnusableBackup(YouTrackDBImpl youTrackDB) throws Exception {
+    if (unusableBackupCreated) {
+      return;
+    }
+    unusableBackupCreated = true;
+    youTrackDB.create(UNUSABLE_SOURCE, DatabaseType.DISK, ADMIN, PASSWORD, ADMIN);
+    var storage = storageOf(youTrackDB, UNUSABLE_SOURCE);
+    var configuration = (CollectionBasedStorageConfiguration) storage.configuration;
+    storage.getAtomicOperationsManager().executeInsideAtomicOperation(
+        atomicOperation -> configuration.updateVersionForTesting(atomicOperation, 23));
+    storage.fullBackup(unusableBackupPath);
+  }
+
   /** Creates the source database with one class and one record. */
   private void createSourceDatabase(YouTrackDBImpl youTrackDB) {
     youTrackDB.create(SOURCE, DatabaseType.DISK, ADMIN, PASSWORD, ADMIN);
@@ -1166,6 +1253,18 @@ public class RestoreLifecycleTest {
     var storage = internalOf(youTrackDB).getStorage(databaseName);
     assertNotNull("the database must hold one registered storage", storage);
     return storage;
+  }
+
+  /** Returns the temporary chain directories of restore requests of the target name. */
+  private static List<String> temporaryChainDirectories() throws IOException {
+    var temporaryRoot = Path.of(System.getProperty("java.io.tmpdir"));
+    try (var paths = Files.list(temporaryRoot)) {
+      return paths
+          .map(path -> path.getFileName().toString())
+          .filter(name -> name.startsWith(TARGET + "-ytdb-backup"))
+          .sorted()
+          .toList();
+    }
   }
 
   /** Returns the admission reason of one database directory, or null for an accepted image. */

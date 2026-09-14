@@ -8,7 +8,6 @@ import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
 import com.jetbrains.youtrackdb.api.gremlin.YTDBGraphTraversalSource;
 import com.jetbrains.youtrackdb.internal.DbTestBase;
 import com.jetbrains.youtrackdb.internal.common.io.IOUtils;
-
 import com.jetbrains.youtrackdb.internal.core.db.YouTrackDBImpl;
 import com.jetbrains.youtrackdb.internal.core.db.tool.DatabaseCompare;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.PropertyType;
@@ -62,8 +61,9 @@ public class StorageBackupTest {
 
         try (var backupChannel = FileChannel.open(backupDir.toPath().resolve(backupFileName),
             StandardOpenOption.WRITE, StandardOpenOption.READ)) {
-          var fileSize = backupChannel.size();
-          var position = random.nextLong(fileSize);
+          // The first byte belongs to backup content, not to the identity header at the tail.
+          // Corrupting it keeps the unit recognizable and makes cleanup deterministic.
+          var position = 0L;
           var data = ByteBuffer.allocate(1);
 
           IOUtils.readByteBuffer(data, backupChannel, position, true);
@@ -130,8 +130,9 @@ public class StorageBackupTest {
 
         try (var backupChannel = FileChannel.open(backupDir.toPath().resolve(backupFileName),
             StandardOpenOption.WRITE, StandardOpenOption.READ)) {
-          var fileSize = backupChannel.size();
-          var position = random.nextLong(fileSize);
+          // The first byte belongs to backup content, not to the identity header at the tail.
+          // Corrupting it keeps the unit recognizable and makes cleanup deterministic.
+          var position = 0L;
           var data = ByteBuffer.allocate(1);
 
           IOUtils.readByteBuffer(data, backupChannel, position, true);
@@ -166,7 +167,6 @@ public class StorageBackupTest {
       Assert.assertTrue(compare.compare());
     }
   }
-
 
   @Test
   public void testRemoveFullBackupAndLeaveTwoIncrementalBackups() throws Exception {
@@ -893,9 +893,7 @@ public class StorageBackupTest {
         random.nextBytes(data);
         final var num = random.nextInt();
 
-        g.addV("BackupClass").
-            property("num", num, "data", data).
-            iterate();
+        g.addV("BackupClass").property("num", num, "data", data).iterate();
       });
     }
   }

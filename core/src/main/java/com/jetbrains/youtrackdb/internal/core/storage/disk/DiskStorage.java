@@ -45,6 +45,7 @@ import com.jetbrains.youtrackdb.internal.core.exception.DatabaseException;
 import com.jetbrains.youtrackdb.internal.core.exception.InvalidStorageEncryptionKeyException;
 import com.jetbrains.youtrackdb.internal.core.exception.SecurityException;
 import com.jetbrains.youtrackdb.internal.core.exception.StorageException;
+import com.jetbrains.youtrackdb.internal.core.exception.UnsupportedBackupException;
 import com.jetbrains.youtrackdb.internal.core.id.RecordIdInternal;
 import com.jetbrains.youtrackdb.internal.core.index.engine.IndexHistogramManager;
 import com.jetbrains.youtrackdb.internal.core.index.engine.v1.BTreeMultiValueIndexEngine;
@@ -75,8 +76,6 @@ import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.wal.W
 import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.wal.cas.CASDiskWriteAheadLog;
 import com.jetbrains.youtrackdb.internal.core.storage.ridbag.AbsoluteChange;
 import com.jetbrains.youtrackdb.internal.core.storage.ridbag.LinkCollectionsBTreeManagerShared;
-import it.unimi.dsi.fastutil.objects.ObjectBooleanImmutablePair;
-import it.unimi.dsi.fastutil.objects.ObjectBooleanPair;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
@@ -92,6 +91,7 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
@@ -108,6 +108,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -120,6 +121,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -157,7 +159,7 @@ public class DiskStorage extends AbstractStorage {
   private static final ThreadLocal<Cipher> CIPHER =
       ThreadLocal.withInitial(DiskStorage::getCipherInstance);
 
-  private static final String IBU_EXTENSION = ".ibu";
+  static final String IBU_EXTENSION = ".ibu";
   /// The metadata is located at the tail and has the following format:
   ///
   /// 1. Version of the backup metadata format is stored as a short value.
@@ -168,11 +170,18 @@ public class DiskStorage extends AbstractStorage {
   /// is stored as long + int values, stored as (-1, -1) for the first (full) backup.
   /// 5. End LSN - the value of the last change stored in the backup (inclusive).
   /// 6. Last transaction ID (idGen counter) at the time of backup. Stored as a long value.
-  /// 7. The hash code of the file's content. Stored as a long value. The XX_HASH algorithm is used
+  /// 7. Feature format version of the backed-up database. Stored as an int value. A feature format
+  /// names the storage features of one database.
+  /// 8. Storage layout version of the backed-up database. Stored as an int value. A storage layout
+  /// version names the on-disk layout of one database.
+  /// 9. Creation completion evidence of the backed-up database. Stored as an int value. The value
+  /// [#CREATION_COMPLETED_EVIDENCE] states a finished creation, and every other value states
+  /// absent evidence.
+  /// 10. The hash code of the file's content. Stored as a long value. The XX_HASH algorithm is used
   /// for hash code calculation.
   private static final int IBU_METADATA_SIZE =
       Short.BYTES + 2 * Long.BYTES + Integer.BYTES + 2 * (Long.BYTES + Integer.BYTES)
-          + Long.BYTES + Long.BYTES;
+          + Long.BYTES + 3 * Integer.BYTES + Long.BYTES;
 
   private static final int IBU_METADATA_VERSION_OFFSET = 0;
 
@@ -194,12 +203,37 @@ public class DiskStorage extends AbstractStorage {
       IBU_METADATA_LAST_LSN_SEGMENT_OFFSET + Long.BYTES;
   private static final int IBU_METADATA_LAST_TX_ID_OFFSET =
       IBU_METADATA_LAST_LSN_POSITION_OFFSET + Integer.BYTES;
-  private static final int IBU_METADATA_HASH_CODE_OFFSET =
+  private static final int IBU_METADATA_FEATURE_FORMAT_OFFSET =
       IBU_METADATA_LAST_TX_ID_OFFSET + Long.BYTES;
+  private static final int IBU_METADATA_LAYOUT_VERSION_OFFSET =
+      IBU_METADATA_FEATURE_FORMAT_OFFSET + Integer.BYTES;
+  private static final int IBU_METADATA_CREATION_EVIDENCE_OFFSET =
+      IBU_METADATA_LAYOUT_VERSION_OFFSET + Integer.BYTES;
+  private static final int IBU_METADATA_HASH_CODE_OFFSET =
+      IBU_METADATA_CREATION_EVIDENCE_OFFSET + Integer.BYTES;
 
-  private static final int CURRENT_BACKUP_FORMAT_VERSION = 2;
+  /**
+   * The backup metadata format version of this build.
+   *
+   * <p>Version 3 added the semantic database format and the creation completion evidence. This
+   * build reads and writes that version only, so every earlier unit stays unsupported.
+   */
+  static final int CURRENT_BACKUP_FORMAT_VERSION = 3;
+
+  /**
+   * States that the creation of the backed-up database finished.
+   *
+   * <p>The writer stores this value only for a source database that carries the durable genesis
+   * completion marker. The value is one fixed marker, so an absent or truncated field never passes
+   * as accepted creation completion evidence.
+   */
+  static final int CREATION_COMPLETED_EVIDENCE = 0x47454E43;
+
+  /** States that the backed-up database carries no creation completion evidence. */
+  static final int CREATION_EVIDENCE_ABSENT = 0;
+
   private static final String CONF_ENTRY_NAME = "database.ocf";
-  private static final String BACKUP_DATEFORMAT = "yyyy-MM-dd-HH-mm-ss";
+  static final String BACKUP_DATEFORMAT = "yyyy-MM-dd-HH-mm-ss";
   private static final String CONF_UTF_8_ENTRY_NAME = "database_utf8.ocf";
   private static final int UUID_LENGTH = 36;
 
@@ -1220,24 +1254,16 @@ public class DiskStorage extends AbstractStorage {
 
           existingFiles.sort(new IBUFileNamesComparator());
 
-          BackupMetadata backupMetadata = null;
-
-          while (!existingFiles.isEmpty()) {
-            var ibuLastFile = existingFiles.removeLast();
-            try (var ibuStream = ibuInputStreamSupplier.apply(ibuLastFile)) {
-              backupMetadata = validateFileAndFetchBackupMetadata(ibuLastFile, getName(), uuid,
-                  ibuStream, null);
-            }
-
-            if (backupMetadata == null) {
-              LogManager.instance()
-                  .error(this, "Backup unit file %s is broken and will be removed.", null,
-                      ibuLastFile);
-              ibuFileRemover.accept(ibuLastFile);
-            } else {
-              break;
-            }
+          // The inspection of the existing chain changes no existing backup file. The removal of
+          // recognized incomplete output follows the complete inspection.
+          var extension = inspectChainForExtension(existingFiles, ibuInputStreamSupplier, uuid);
+          for (var removableFile : extension.removableFiles()) {
+            LogManager.instance()
+                .error(this, "Backup unit file %s is broken and will be removed.", null,
+                    removableFile);
+            ibuFileRemover.accept(removableFile);
           }
+          var backupMetadata = extension.chainHead();
 
           int nextFileIndex;
           LogSequenceNumber fromLsn = null;
@@ -1252,12 +1278,15 @@ public class DiskStorage extends AbstractStorage {
           ibuNextFile = createIbuFileName(nextFileIndex, uuidString);
           LogManager.instance()
               .info(this, "Backup unit file %s will be created.", ibuNextFile);
+          // The semantic identity comes from this open source database, and the read precedes
+          // the content copy. The new unit therefore carries the identity of its own database.
+          var semanticIdentity = currentBackupSemanticIdentity();
           try (var fileStream = ibuOutputStreamSupplier.apply(ibuNextFile)) {
             var xxHashStream = new XXHashOutputStream(fileStream);
             var lastLsn = storeBackupDataToStream(xxHashStream, fromLsn);
 
             writeBackupMetadata(xxHashStream, uuid, nextFileIndex, fromLsn, lastLsn,
-                getIdGen().getLastId());
+                getIdGen().getLastId(), semanticIdentity);
           }
 
           LogManager.instance()
@@ -1281,9 +1310,107 @@ public class DiskStorage extends AbstractStorage {
     return ibuNextFile;
   }
 
+  /**
+   * Inspects every unit of one existing backup chain without any change of that chain.
+   *
+   * <p>The inspection walks from the newest unit to the oldest unit. The first supported unit
+   * becomes the head of the extended chain. A unit above that head that this build recognizes as
+   * its own incomplete output joins the removable set. The walk then continues below the head,
+   * because one unsupported older unit refuses the extension of the whole chain.
+   *
+   * <p>The two inspections of this walk differ on purpose. Every unit down to the head keeps the
+   * full content check, because an interrupted backup writes exactly there. Every older unit gets
+   * the header-only admission of {@link #inspectBackupUnitHeader}, which reads no content hash.
+   * One extension therefore never hashes the complete chain.
+   *
+   * <p>An unreadable or unclassifiable unit refuses the extension. Such a unit can hold an old
+   * backup of real value, so this build never removes it. An operator resolves that unit and then
+   * repeats the backup. A refusal reaches the caller before any removal, so a refused chain keeps
+   * every file.
+   *
+   * @param existingFiles every existing unit of this database, ordered from oldest to newest
+   * @param ibuInputStreamSupplier opens one existing unit for reading
+   * @param uuid the database identifier (UUID) of this database
+   * @throws UnsupportedBackupException when one inspected unit refuses the extension
+   */
+  private ChainExtension inspectChainForExtension(List<String> existingFiles,
+      Function<String, InputStream> ibuInputStreamSupplier, UUID uuid) throws IOException {
+    var remainingFiles = new ArrayList<>(existingFiles);
+    var removableFiles = new ArrayList<String>();
+    BackupMetadata chainHead = null;
+
+    while (!remainingFiles.isEmpty()) {
+      var ibuLastFile = remainingFiles.removeLast();
+      var headFound = chainHead != null;
+      BackupUnitInspection inspection;
+      try (var ibuStream = ibuInputStreamSupplier.apply(ibuLastFile)) {
+        inspection = headFound
+            ? inspectBackupUnitHeader(ibuLastFile, getName(), uuid, ibuStream)
+            : inspectBackupUnit(ibuLastFile, getName(), uuid, ibuStream, null);
+      }
+
+      switch (inspection.classification()) {
+        case SUPPORTED -> {
+          if (!headFound) {
+            chainHead = inspection.metadata();
+          }
+        }
+        case RECOGNIZED_INCOMPLETE -> {
+          if (headFound) {
+            // Defense in depth. The header-only admission of an older unit runs no content
+            // check, so no removal ever covers a unit below the head of the chain.
+            throw refusedChainExtension(ibuLastFile, inspection.detail());
+          }
+          removableFiles.add(ibuLastFile);
+        }
+        case UNCLASSIFIABLE -> throw refusedChainExtension(ibuLastFile, inspection.detail());
+      }
+    }
+
+    return new ChainExtension(chainHead, removableFiles);
+  }
+
+  /** Builds the refusal of one chain extension. The refusal changes no backup unit file. */
+  private UnsupportedBackupException refusedChainExtension(String ibuFileName, String detail) {
+    return new UnsupportedBackupException(name,
+        "The incremental backup of database '" + name + "' refuses to extend the chain,"
+            + " because the backup unit file " + ibuFileName
+            + " carries no supported backup header. " + detail
+            + " This backup keeps every existing backup unit file. Resolve that file, or"
+            + " create a full backup in a new empty location.");
+  }
+
+  /**
+   * Reads the semantic identity of this open source database for one new backup unit.
+   *
+   * <p>The feature format comes from this build, and the storage open of this database accepted
+   * that same feature format. The storage layout version comes from this build as well, because a
+   * storage open accepts one layout version only.
+   *
+   * <p>The creation completion evidence comes from the durable genesis completion marker of this
+   * database. A database without that marker therefore produces a backup unit without accepted
+   * creation completion evidence. Every later restore of that unit refuses the unit.
+   */
+  private BackupSemanticIdentity currentBackupSemanticIdentity() {
+    var genesisCompleted =
+        Boolean.parseBoolean(configuration.getProperty(SharedContext.GENESIS_COMPLETED_PROPERTY));
+    return new BackupSemanticIdentity(
+        FEATURE_FORMAT.version(),
+        StorageConfiguration.CURRENT_VERSION,
+        genesisCompleted ? CREATION_COMPLETED_EVIDENCE : CREATION_EVIDENCE_ABSENT);
+  }
+
+  /** Returns the semantic identity that this build accepts in one backup header. */
+  static BackupSemanticIdentity supportedBackupSemanticIdentity() {
+    return new BackupSemanticIdentity(
+        FEATURE_FORMAT.version(),
+        StorageConfiguration.CURRENT_VERSION,
+        CREATION_COMPLETED_EVIDENCE);
+  }
+
   private static void writeBackupMetadata(XXHashOutputStream xxHashStream, UUID uuid,
       int nextFileIndex, LogSequenceNumber fromLsn, LogSequenceNumber lastLsn,
-      long lastTxId) throws IOException {
+      long lastTxId, BackupSemanticIdentity semanticIdentity) throws IOException {
     var dataOutputStream = new DataOutputStream(xxHashStream);
     dataOutputStream.writeShort(CURRENT_BACKUP_FORMAT_VERSION);
 
@@ -1303,6 +1430,10 @@ public class DiskStorage extends AbstractStorage {
 
     dataOutputStream.writeLong(lastTxId);
 
+    dataOutputStream.writeInt(semanticIdentity.featureFormatVersion());
+    dataOutputStream.writeInt(semanticIdentity.storageLayoutVersion());
+    dataOutputStream.writeInt(semanticIdentity.creationEvidence());
+
     dataOutputStream.flush();
 
     var hashCode = xxHashStream.xxHash64.getValue();
@@ -1316,208 +1447,394 @@ public class DiskStorage extends AbstractStorage {
     return uuid + "-" + strDate + "-" + backupNumber + "-" + name + IBU_EXTENSION;
   }
 
+  /**
+   * Validates one backup unit and returns its metadata, or null for every rejected unit.
+   *
+   * <p>This method reports the decision alone. The caller that needs the reason of one rejection
+   * calls {@link #inspectBackupUnit} instead.
+   */
   @Nullable protected static BackupMetadata validateFileAndFetchBackupMetadata(String ibuFileName,
       String storageName,
       @Nullable UUID dbUUID,
       @Nonnull InputStream inputStream, @Nullable OutputStream copyStream)
       throws IOException {
+    return inspectBackupUnit(ibuFileName, storageName, dbUUID, inputStream, copyStream).metadata();
+  }
+
+  /**
+   * Reads one backup unit, copies the read bytes, and classifies the unit.
+   *
+   * <p>The classification separates three cases. A supported unit passes every header check and
+   * every content check. A recognized incomplete unit carries the complete supported header of
+   * this database and fails the content check. Every other unit is unclassifiable.
+   *
+   * <p>The unclassifiable outcome covers an old header and a header of another build. It also
+   * covers a header without accepted creation completion evidence. It covers a disagreeing file
+   * name and unreadable output too.
+   *
+   * <p>The copy stream receives every read byte, including the bytes of a rejected unit. The
+   * caller therefore validates and copies in one pass.
+   *
+   * @param ibuFileName the name of the inspected unit
+   * @param storageName the database name that owns the inspection, used in the log only
+   * @param dbUUID the expected database identifier (UUID), or null when the caller expects any
+   * @param inputStream the source of the unit
+   * @param copyStream the optional destination of every read byte
+   */
+  static BackupUnitInspection inspectBackupUnit(String ibuFileName,
+      String storageName,
+      @Nullable UUID dbUUID,
+      @Nonnull InputStream inputStream, @Nullable OutputStream copyStream)
+      throws IOException {
+    try (var xxHash64 = XXHashFactory.fastestInstance().newStreamingHash64(XX_HASH_SEED)) {
+      var trailer =
+          readBackupUnitTrailer(ibuFileName, storageName, inputStream, copyStream, xxHash64);
+      if (trailer.header() == null) {
+        return unclassifiableUnit(trailer.failureDetail());
+      }
+
+      // The stored hash code stays outside its own calculation, so the hash covers the content
+      // and the header up to that stored value.
+      xxHash64.update(trailer.header(), 0, IBU_METADATA_HASH_CODE_OFFSET);
+      return classifyBackupUnit(ibuFileName, storageName, dbUUID, trailer.header(),
+          xxHash64.getValue());
+    }
+  }
+
+  /**
+   * Reads the header of one backup unit and admits that header without any content check.
+   *
+   * <p>This inspection serves one unit below the head of an existing chain. The boundary between
+   * the two inspections of the extension is deliberate. The trailing units down to the head keep
+   * the full content check, because an interrupted backup writes exactly there. Every older unit
+   * passed that same content check when the backup of the unit above it read the whole chain.
+   * This header-only admission therefore keeps the cost of one extension bounded.
+   *
+   * <p>The admission checks the backup format version, the database feature format, the storage
+   * layout version, the creation completion evidence, and the database identifier (UUID). The
+   * outcome is supported or unclassifiable, because no content check runs here.
+   *
+   * @param ibuFileName the name of the inspected unit
+   * @param storageName the database name that owns the inspection, used in the log only
+   * @param dbUUID the expected database identifier (UUID), or null when the caller expects any
+   * @param inputStream the source of the unit
+   */
+  static BackupUnitInspection inspectBackupUnitHeader(String ibuFileName, String storageName,
+      @Nullable UUID dbUUID, @Nonnull InputStream inputStream) throws IOException {
+    var trailer = readBackupUnitTrailer(ibuFileName, storageName, inputStream, null, null);
+    if (trailer.header() == null) {
+      return unclassifiableUnit(trailer.failureDetail());
+    }
+    return classifyBackupUnit(ibuFileName, storageName, dbUUID, trailer.header(), null);
+  }
+
+  /**
+   * Reads one backup unit to its end and keeps the trailing header bytes of that unit.
+   *
+   * <p>The optional hash receives every byte outside the returned header. The optional copy
+   * stream receives every read byte. A null hash therefore skips the content check of the caller.
+   */
+  private static BackupUnitTrailer readBackupUnitTrailer(String ibuFileName, String storageName,
+      @Nonnull InputStream inputStream, @Nullable OutputStream copyStream,
+      @Nullable StreamingXXHash64 xxHash64) throws IOException {
     byte[] metaDataCandidate = null;
 
-    try (var xxHash64 = XXHashFactory.fastestInstance().newStreamingHash64(XX_HASH_SEED)) {
+    var buffer = new byte[(64 << 10)];
+    var read = 0;
 
-      var buffer = new byte[(64 << 10)];
-      var read = 0;
+    while (true) {
+      read = inputStream.read(buffer);
 
-      while (true) {
-        read = inputStream.read(buffer);
-
-        if (read == -1) {
-          break;
-        } else if (read == 0) {
-          continue;
-        }
-
-        if (metaDataCandidate == null) {
-          if (read < IBU_METADATA_SIZE) {
-            //read till we will not have to read metadata information
-            var bytesLeftToRead = IBU_METADATA_SIZE - read;
-            while (bytesLeftToRead > 0) {
-              var r = inputStream.read(buffer, read, buffer.length - read);
-              if (r == -1) {
-                LogManager.instance().warn(DiskStorage.class, storageName,
-                    "Size of the file %s is less than needed to store information about metadata. "
-                        + "Size should be at least %d but real size is %d.",
-                    ibuFileName,
-                    IBU_METADATA_SIZE, read);
-                return null;
-              }
-
-              read += r;
-              bytesLeftToRead -= r;
-            }
-          }
-
-          metaDataCandidate = new byte[IBU_METADATA_SIZE];
-          System.arraycopy(buffer, read - IBU_METADATA_SIZE, metaDataCandidate, 0,
-              IBU_METADATA_SIZE);
-
-          //calculate hash code everything except metadata
-          //hash code from metadata will be calculated at the end
-          xxHash64.update(buffer, 0, read - IBU_METADATA_SIZE);
-        } else {
-          if (read >= IBU_METADATA_SIZE) {
-            //tail of data, not metadata for sure
-            xxHash64.update(metaDataCandidate, 0, IBU_METADATA_SIZE);
-            //hash code from metadata will be calculated at the end
-            xxHash64.update(buffer, 0, read - IBU_METADATA_SIZE);
-            //potential metadata content
-            System.arraycopy(buffer, read - IBU_METADATA_SIZE,
-                metaDataCandidate, 0, IBU_METADATA_SIZE);
-          } else {
-            //part of metadata that will be replaced
-            xxHash64.update(metaDataCandidate, 0, read);
-            //shift metadata to the left
-            System.arraycopy(metaDataCandidate, read, metaDataCandidate, 0,
-                IBU_METADATA_SIZE - read);
-            //add new bytes that can be treated as metadata if they are the last ones
-            System.arraycopy(buffer, 0, metaDataCandidate, IBU_METADATA_SIZE - read, read);
-          }
-        }
-
-        if (copyStream != null && read > 0) {
-          copyStream.write(buffer, 0, read);
-        }
+      if (read == -1) {
+        break;
+      } else if (read == 0) {
+        continue;
       }
 
       if (metaDataCandidate == null) {
-        LogManager.instance()
-            .warn(DiskStorage.class, storageName, "File %s does not contain backup metadata.",
-                ibuFileName);
-        return null;
-      }
+        if (read < IBU_METADATA_SIZE) {
+          //read till we will not have to read metadata information
+          var bytesLeftToRead = IBU_METADATA_SIZE - read;
+          while (bytesLeftToRead > 0) {
+            var r = inputStream.read(buffer, read, buffer.length - read);
+            if (r == -1) {
+              LogManager.instance().warn(DiskStorage.class, storageName,
+                  "Size of the file %s is less than needed to store information about metadata. "
+                      + "Size should be at least %d but real size is %d.",
+                  ibuFileName,
+                  IBU_METADATA_SIZE, read);
+              return new BackupUnitTrailer(null,
+                  "The file holds fewer bytes than one backup header needs.");
+            }
 
-      xxHash64.update(metaDataCandidate, 0, IBU_METADATA_HASH_CODE_OFFSET);
+            read += r;
+            bytesLeftToRead -= r;
+          }
+        }
 
-      var metadataVersion = ShortSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_VERSION_OFFSET);
-      var metadataUUIDLowerBits = LongSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_UUID_LOW_OFFSET);
-      var metadataUUIDHigherBits = LongSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_UUID_HIGH_OFFSET);
-      var metadataSequenceNumber = IntegerSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_SEQUENCE_OFFSET);
-      var metadataStartLsnSegment = LongSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_FIRST_LSN_SEGMENT_OFFSET);
-      var metadataStartLsnPosition = IntegerSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_START_LSN_POSITION_OFFSET);
-      var metadataLastLsnSegment = LongSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_LAST_LSN_SEGMENT_OFFSET);
-      var metadataEndLsnPosition = IntegerSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_LAST_LSN_POSITION_OFFSET);
-      var metadataLastTxId = LongSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_LAST_TX_ID_OFFSET);
-      var metadataHashCode = LongSerializer.deserializeLiteral(metaDataCandidate,
-          IBU_METADATA_HASH_CODE_OFFSET);
+        metaDataCandidate = new byte[IBU_METADATA_SIZE];
+        System.arraycopy(buffer, read - IBU_METADATA_SIZE, metaDataCandidate, 0,
+            IBU_METADATA_SIZE);
 
-      var calculatedHashCode = xxHash64.getValue();
-      xxHash64.close();
-
-      if (calculatedHashCode != metadataHashCode) {
-        LogManager.instance()
-            .warn(DiskStorage.class, storageName,
-                "Hash code of the file %s is broken. Calculated hash code is %d but stored hash code is %d.",
-                ibuFileName, calculatedHashCode, metadataHashCode);
-        return null;
-      }
-
-      if (dbUUID != null) {
-        if (dbUUID.getLeastSignificantBits() != metadataUUIDLowerBits
-            || dbUUID.getMostSignificantBits() != metadataUUIDHigherBits) {
-          var storedUUID = new UUID(metadataUUIDLowerBits, metadataUUIDHigherBits);
-          LogManager.instance()
-              .warn(DiskStorage.class, storageName,
-                  "UUID of the file %s stored in metadata %s does not match DB UUID %s.",
-                  ibuFileName, storedUUID, dbUUID);
-          return null;
+        //calculate hash code everything except metadata
+        //hash code from metadata will be calculated at the end
+        updateHash(xxHash64, buffer, 0, read - IBU_METADATA_SIZE);
+      } else {
+        if (read >= IBU_METADATA_SIZE) {
+          //tail of data, not metadata for sure
+          updateHash(xxHash64, metaDataCandidate, 0, IBU_METADATA_SIZE);
+          //hash code from metadata will be calculated at the end
+          updateHash(xxHash64, buffer, 0, read - IBU_METADATA_SIZE);
+          //potential metadata content
+          System.arraycopy(buffer, read - IBU_METADATA_SIZE,
+              metaDataCandidate, 0, IBU_METADATA_SIZE);
+        } else {
+          //part of metadata that will be replaced
+          updateHash(xxHash64, metaDataCandidate, 0, read);
+          //shift metadata to the left
+          System.arraycopy(metaDataCandidate, read, metaDataCandidate, 0,
+              IBU_METADATA_SIZE - read);
+          //add new bytes that can be treated as metadata if they are the last ones
+          System.arraycopy(buffer, 0, metaDataCandidate, IBU_METADATA_SIZE - read, read);
         }
       }
 
-      if (ibuFileName.length() < UUID_LENGTH) {
-        LogManager.instance().warn(DiskStorage.class, storageName,
-            "File name %s does not contain DB UUID.", ibuFileName);
-        return null;
+      if (copyStream != null && read > 0) {
+        copyStream.write(buffer, 0, read);
       }
-
-      if (metadataVersion != CURRENT_BACKUP_FORMAT_VERSION) {
-        LogManager.instance()
-            .warn(DiskStorage.class, storageName,
-                "Version of the file %s stored in metadata %d does not match supported version %d.",
-                ibuFileName, metadataVersion, CURRENT_BACKUP_FORMAT_VERSION);
-        return null;
-      }
-
-      UUID fileNameUUID;
-      try {
-        fileNameUUID = UUID.fromString(ibuFileName.substring(0, UUID_LENGTH));
-      } catch (IllegalArgumentException e) {
-        LogManager.instance().warn(DiskStorage.class, storageName,
-            "UUID of the file %s is incorrect.", ibuFileName);
-        return null;
-      }
-
-      if (fileNameUUID.getLeastSignificantBits() != metadataUUIDLowerBits
-          || fileNameUUID.getMostSignificantBits() != metadataUUIDHigherBits) {
-        LogManager.instance()
-            .warn(DiskStorage.class, storageName,
-                "UUID of the file %s does not match DB UUID %s.", ibuFileName, dbUUID);
-      }
-
-      //uuid-date-sequence number
-      var sequenceNumberStart = UUID_LENGTH + 1 + BACKUP_DATEFORMAT.length() + 1;
-      var afterSequenceDashIndex = ibuFileName.indexOf('-', sequenceNumberStart);
-      if (afterSequenceDashIndex == -1) {
-        LogManager.instance()
-            .warn(DiskStorage.class, storageName,
-                "File %s does not contain backup sequence number.", ibuFileName);
-      }
-
-      int sequenceNumber;
-      try {
-        sequenceNumber = Integer.parseInt(
-            ibuFileName.substring(sequenceNumberStart, afterSequenceDashIndex));
-      } catch (NumberFormatException e) {
-        LogManager.instance()
-            .warn(DiskStorage.class, storageName,
-                "Sequence number of the file %s is incorrect.", ibuFileName);
-        return null;
-      }
-
-      if (metadataSequenceNumber != sequenceNumber) {
-        LogManager.instance()
-            .warn(DiskStorage.class, storageName,
-                "Sequence number of the file %s stored in metadata %s does not match DB "
-                    + "sequence number %s.",
-                ibuFileName, sequenceNumber, metadataSequenceNumber);
-        return null;
-      }
-
-      LogSequenceNumber startLsn = null;
-      if (metadataStartLsnSegment != -1 && metadataStartLsnPosition != -1) {
-        startLsn = new LogSequenceNumber(metadataStartLsnSegment, metadataStartLsnPosition);
-      }
-      if (metadataLastLsnSegment == -1 || metadataEndLsnPosition == -1) {
-        LogManager.instance()
-            .warn(DiskStorage.class, storageName,
-                "Last LSN of the file %s stored in metadata is incorrect.",
-                ibuFileName);
-        return null;
-      }
-
-      var lastLsn = new LogSequenceNumber(metadataLastLsnSegment, metadataEndLsnPosition);
-
-      return new BackupMetadata(metadataVersion, fileNameUUID, sequenceNumber, startLsn, lastLsn,
-          metadataLastTxId);
     }
+
+    if (metaDataCandidate == null) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName, "File %s does not contain backup metadata.",
+              ibuFileName);
+      return new BackupUnitTrailer(null, "The file contains no backup header at all.");
+    }
+
+    return new BackupUnitTrailer(metaDataCandidate, null);
+  }
+
+  /** Updates one optional hash, so a header-only read skips every hash update. */
+  private static void updateHash(@Nullable StreamingXXHash64 xxHash64, byte[] bytes, int offset,
+      int length) {
+    if (xxHash64 != null) {
+      xxHash64.update(bytes, offset, length);
+    }
+  }
+
+  /**
+   * Classifies one backup unit from its header, and from the content hash of the caller.
+   *
+   * <p>A null content hash states that no content check ran. The classification then reports a
+   * supported unit or an unclassifiable unit, because only a content check produces recognized
+   * incomplete output.
+   *
+   * @param metaDataCandidate the trailing header bytes of the unit
+   * @param calculatedHashCode the hash of the read content, or null for a header-only admission
+   */
+  private static BackupUnitInspection classifyBackupUnit(String ibuFileName, String storageName,
+      @Nullable UUID dbUUID, byte[] metaDataCandidate, @Nullable Long calculatedHashCode) {
+    var metadataVersion = ShortSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_VERSION_OFFSET);
+    var metadataUUIDLowerBits = LongSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_UUID_LOW_OFFSET);
+    var metadataUUIDHigherBits = LongSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_UUID_HIGH_OFFSET);
+    var metadataSequenceNumber = IntegerSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_SEQUENCE_OFFSET);
+    var metadataStartLsnSegment = LongSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_FIRST_LSN_SEGMENT_OFFSET);
+    var metadataStartLsnPosition = IntegerSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_START_LSN_POSITION_OFFSET);
+    var metadataLastLsnSegment = LongSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_LAST_LSN_SEGMENT_OFFSET);
+    var metadataEndLsnPosition = IntegerSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_LAST_LSN_POSITION_OFFSET);
+    var metadataLastTxId = LongSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_LAST_TX_ID_OFFSET);
+    var metadataFeatureFormat = IntegerSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_FEATURE_FORMAT_OFFSET);
+    var metadataLayoutVersion = IntegerSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_LAYOUT_VERSION_OFFSET);
+    var metadataCreationEvidence = IntegerSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_CREATION_EVIDENCE_OFFSET);
+    var metadataHashCode = LongSerializer.deserializeLiteral(metaDataCandidate,
+        IBU_METADATA_HASH_CODE_OFFSET);
+
+    var semanticIdentity = new BackupSemanticIdentity(metadataFeatureFormat,
+        metadataLayoutVersion, metadataCreationEvidence);
+    // A recognized unit carries the complete supported header of this very database. Only such
+    // a unit becomes removable output of an interrupted backup of this build. Every other unit
+    // can hold a valuable old backup, so no automatic removal ever covers it.
+    var recognized = metadataVersion == CURRENT_BACKUP_FORMAT_VERSION
+        && semanticIdentity.equals(supportedBackupSemanticIdentity())
+        && dbUUID != null
+        && dbUUID.getLeastSignificantBits() == metadataUUIDLowerBits
+        && dbUUID.getMostSignificantBits() == metadataUUIDHigherBits;
+
+    // The failed content check of a recognized header is the only removable outcome. Every
+    // other failure below keeps its unit, because that unit can hold a valuable old backup.
+    if (calculatedHashCode != null && calculatedHashCode != metadataHashCode) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "Hash code of the file %s is broken. Calculated hash code is %d but stored hash code is %d.",
+              ibuFileName, calculatedHashCode, metadataHashCode);
+      return incompleteOrUnclassifiableUnit(recognized,
+          "The stored hash code of the file does not match its content.");
+    }
+
+    if (dbUUID != null) {
+      if (dbUUID.getLeastSignificantBits() != metadataUUIDLowerBits
+          || dbUUID.getMostSignificantBits() != metadataUUIDHigherBits) {
+        var storedUUID = new UUID(metadataUUIDLowerBits, metadataUUIDHigherBits);
+        LogManager.instance()
+            .warn(DiskStorage.class, storageName,
+                "Database identifier (UUID) of the file %s stored in metadata %s does not match "
+                    + "the database identifier %s.",
+                ibuFileName, storedUUID, dbUUID);
+        return unclassifiableUnit("The header names another database than the expected one.");
+      }
+    }
+
+    if (ibuFileName.length() < UUID_LENGTH) {
+      LogManager.instance().warn(DiskStorage.class, storageName,
+          "File name %s does not contain the database identifier (UUID).", ibuFileName);
+      return unclassifiableUnit("The file name carries no database identifier (UUID).");
+    }
+
+    if (metadataVersion != CURRENT_BACKUP_FORMAT_VERSION) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "Version of the file %s stored in metadata %d does not match supported version %d.",
+              ibuFileName, metadataVersion, CURRENT_BACKUP_FORMAT_VERSION);
+      return unclassifiableUnit("The header carries backup format version "
+          + metadataVersion + ", and this build supports backup format version "
+          + CURRENT_BACKUP_FORMAT_VERSION + " only.");
+    }
+
+    if (metadataFeatureFormat != FEATURE_FORMAT.version()) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "Feature format %d of the file %s does not match supported feature format %d.",
+              metadataFeatureFormat, ibuFileName, FEATURE_FORMAT.version());
+      return unclassifiableUnit("The header carries database feature format "
+          + metadataFeatureFormat + ", and this build supports database feature format "
+          + FEATURE_FORMAT.version() + " only.");
+    }
+
+    if (metadataLayoutVersion != StorageConfiguration.CURRENT_VERSION) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "Storage layout version %d of the file %s does not match supported version %d.",
+              metadataLayoutVersion, ibuFileName, StorageConfiguration.CURRENT_VERSION);
+      return unclassifiableUnit("The header carries storage layout version "
+          + metadataLayoutVersion + ", and this build supports storage layout version "
+          + StorageConfiguration.CURRENT_VERSION + " only.");
+    }
+
+    if (metadataCreationEvidence != CREATION_COMPLETED_EVIDENCE) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "File %s carries no accepted creation completion evidence.", ibuFileName);
+      return unclassifiableUnit("The header carries no accepted creation completion evidence.");
+    }
+
+    UUID fileNameUUID;
+    try {
+      fileNameUUID = UUID.fromString(ibuFileName.substring(0, UUID_LENGTH));
+    } catch (IllegalArgumentException e) {
+      LogManager.instance().warn(DiskStorage.class, storageName,
+          "Database identifier (UUID) of the file %s is incorrect.", ibuFileName);
+      return unclassifiableUnit("The file name carries no valid database identifier (UUID).");
+    }
+
+    if (fileNameUUID.getLeastSignificantBits() != metadataUUIDLowerBits
+        || fileNameUUID.getMostSignificantBits() != metadataUUIDHigherBits) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "Database identifier (UUID) of the file %s does not match the database identifier"
+                  + " %s.",
+              ibuFileName, dbUUID);
+    }
+
+    //uuid-date-sequence number
+    var sequenceNumberStart = UUID_LENGTH + 1 + BACKUP_DATEFORMAT.length() + 1;
+    var afterSequenceDashIndex = ibuFileName.indexOf('-', sequenceNumberStart);
+    // A name without that separator carries no readable sequence number. The refusal below is
+    // controlled, so no index arithmetic of a foreign name ever reaches the caller.
+    if (afterSequenceDashIndex == -1) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "File %s does not contain backup sequence number.", ibuFileName);
+      return unclassifiableUnit("The file name carries no backup sequence number.");
+    }
+
+    int sequenceNumber;
+    try {
+      sequenceNumber = Integer.parseInt(
+          ibuFileName.substring(sequenceNumberStart, afterSequenceDashIndex));
+    } catch (NumberFormatException e) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "Sequence number of the file %s is incorrect.", ibuFileName);
+      return unclassifiableUnit("The file name carries no valid backup sequence number.");
+    }
+
+    // A disagreement of the file name and the header is ambiguous, because an operator can have
+    // renamed complete output. Such a unit therefore stays in place.
+    if (metadataSequenceNumber != sequenceNumber) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "Sequence number of the file %s stored in metadata %s does not match DB "
+                  + "sequence number %s.",
+              ibuFileName, sequenceNumber, metadataSequenceNumber);
+      return unclassifiableUnit(
+          "The header and the file name name different backup sequence numbers.");
+    }
+
+    LogSequenceNumber startLsn = null;
+    if (metadataStartLsnSegment != -1 && metadataStartLsnPosition != -1) {
+      startLsn = new LogSequenceNumber(metadataStartLsnSegment, metadataStartLsnPosition);
+    }
+    if (metadataLastLsnSegment == -1 || metadataEndLsnPosition == -1) {
+      LogManager.instance()
+          .warn(DiskStorage.class, storageName,
+              "Last LSN of the file %s stored in metadata is incorrect.",
+              ibuFileName);
+      return unclassifiableUnit("The header carries no valid last log sequence number.");
+    }
+
+    var lastLsn = new LogSequenceNumber(metadataLastLsnSegment, metadataEndLsnPosition);
+
+    return new BackupUnitInspection(
+        BackupUnitClassification.SUPPORTED,
+        new BackupMetadata(metadataVersion, fileNameUUID, sequenceNumber, startLsn, lastLsn,
+            metadataLastTxId, semanticIdentity),
+        false,
+        calculatedHashCode == null
+            ? "The unit passes every header check."
+            : "The unit passes every header check and every content check.");
+  }
+
+  /** Builds the inspection of one unit that this build cannot classify. */
+  private static BackupUnitInspection unclassifiableUnit(String detail) {
+    return new BackupUnitInspection(BackupUnitClassification.UNCLASSIFIABLE, null, false, detail);
+  }
+
+  /**
+   * Builds the inspection of one unit that failed its content check.
+   *
+   * @param recognized true when the unit carries the complete supported header of this database
+   */
+  private static BackupUnitInspection incompleteOrUnclassifiableUnit(boolean recognized,
+      String detail) {
+    return new BackupUnitInspection(
+        recognized
+            ? BackupUnitClassification.RECOGNIZED_INCOMPLETE
+            : BackupUnitClassification.UNCLASSIFIABLE,
+        null,
+        true,
+        detail);
   }
 
   private LogSequenceNumber storeBackupDataToStream(OutputStream stream,
@@ -1742,7 +2059,31 @@ public class DiskStorage extends AbstractStorage {
 
   @Override
   public void restoreFromBackup(Path backupDirectory, String expectedUUID) {
-    restoreFromBackup(() -> {
+    try (var prepared = prepareBackupChain(name, backupDirectory, expectedUUID)) {
+      restoreFromPreparedBackupChain(prepared);
+    }
+  }
+
+  @Override
+  public void restoreFromBackup(Supplier<Iterator<String>> ibuFilesSupplier,
+      Function<String, InputStream> ibuInputStreamSupplier, @Nullable String expectedUUID) {
+    try (var prepared =
+        prepareBackupChain(name, ibuFilesSupplier, ibuInputStreamSupplier, expectedUUID)) {
+      restoreFromPreparedBackupChain(prepared);
+    }
+  }
+
+  /**
+   * Returns the existing listing rule of one local backup directory.
+   *
+   * <p>The rule skips every directory entry and every entry without the backup unit extension. An
+   * expected database identifier (UUID) additionally restricts the rule to the units of that
+   * database.
+   * The rule therefore keeps every unrelated file of the directory out of one restore.
+   */
+  public static Supplier<Iterator<String>> localBackupFileNames(String storageName,
+      Path backupDirectory, @Nullable String expectedUUID) {
+    return () -> {
       try (var filesStream = Files.list(backupDirectory)) {
         return filesStream.filter(path -> {
           if (Files.isDirectory(path)) {
@@ -1756,41 +2097,294 @@ public class DiskStorage extends AbstractStorage {
                   expectedUUID));
         }).map(path -> path.getFileName().toString()).toList().iterator();
       } catch (IOException e) {
-        throw BaseException.wrapException(new DatabaseException(name,
-            "Can not list backup unit files in directory '" + backupDirectory + "'"), e, name);
+        throw BaseException.wrapException(new DatabaseException(storageName,
+            "Can not list backup unit files in directory '" + backupDirectory + "'"), e,
+            storageName);
       }
-    }, ibuFileName -> {
-      var ibuPath = backupDirectory.resolve(ibuFileName);
-      try {
-        return new BufferedInputStream(
-            Files.newInputStream(backupDirectory.resolve(ibuFileName)));
-      } catch (IOException e) {
-        throw BaseException.wrapException(new DatabaseException(name,
-            "Can open backup unit file " + ibuPath + " to read it."), e, name);
-      }
-    }, expectedUUID);
+    };
   }
 
-  @Override
-  public void restoreFromBackup(Supplier<Iterator<String>> ibuFilesSupplier,
-      Function<String, InputStream> ibuInputStreamSupplier, @Nullable String expectedUUID) {
-    stateLock.writeLock().lock();
-    try {
-      UUID uuidExpectedInBackup = null;
-      if (expectedUUID != null) {
-        expectedUUID = expectedUUID.trim();
+  /** Returns the existing read rule of one local backup directory. */
+  public static Function<String, InputStream> localBackupFileStreams(String storageName,
+      Path backupDirectory) {
+    return new IBULocalFileInputStreamSupplier(backupDirectory, storageName);
+  }
 
-        if (!expectedUUID.isEmpty()) {
-          try {
-            uuidExpectedInBackup = UUID.fromString(expectedUUID);
-          } catch (IllegalArgumentException e) {
-            LogManager.instance()
-                .error(this, "Expected UUID of the backup %s is incorrect.", e, expectedUUID);
-            throw e;
+  /** Prepares the selected chain of one local backup directory. */
+  public static PreparedBackupChain prepareBackupChain(String storageName, Path backupDirectory,
+      @Nullable String expectedUUID) {
+    return prepareBackupChain(storageName,
+        localBackupFileNames(storageName, backupDirectory, expectedUUID),
+        localBackupFileStreams(storageName, backupDirectory),
+        expectedUUID);
+  }
+
+  /**
+   * Copies one selected backup chain into request-owned temporary files and validates every copy.
+   *
+   * <p>The preparation runs before every target change. The preparation refuses an unsupported
+   * header and a broken unit. The preparation also refuses a chain of two databases, a chain
+   * without a full backup, and a chain with a gap. A refusal therefore precedes the creation, the
+   * deletion, and the recreation of any restore target.
+   *
+   * <p>The returned chain owns the temporary copies and the temporary directory of one request.
+   * The caller closes the chain, which removes both. The replay reads those same copies, so a
+   * later change of the source never reaches the target.
+   *
+   * <p>The preparation holds no lock of the target, and the preparation opens one source stream at
+   * a time. The preparation copies through one small buffer, so no chain-sized memory is needed.
+   *
+   * @param storageName the database name of the restore request
+   * @param ibuFilesSupplier lists the candidate unit names of the source
+   * @param ibuInputStreamSupplier opens one source unit for reading
+   * @param expectedUUID the expected database identifier (UUID) of the source, or null for any
+   * @throws UnsupportedBackupException when one selected unit carries no supported header
+   */
+  public static PreparedBackupChain prepareBackupChain(String storageName,
+      Supplier<Iterator<String>> ibuFilesSupplier,
+      Function<String, InputStream> ibuInputStreamSupplier,
+      @Nullable String expectedUUID) {
+    return prepareBackupChain(storageName, ibuFilesSupplier, ibuInputStreamSupplier, expectedUUID,
+        null);
+  }
+
+  /**
+   * Prepares one chain with an optional request-scoped output decorator used by failure tests.
+   *
+   * <p>Production callers pass no decorator. The decorator lets a manager test inject a checked
+   * write failure after an output opens without changing source or filesystem semantics.
+   */
+  public static PreparedBackupChain prepareBackupChain(String storageName,
+      Supplier<Iterator<String>> ibuFilesSupplier,
+      Function<String, InputStream> ibuInputStreamSupplier,
+      @Nullable String expectedUUID, @Nullable UnaryOperator<OutputStream> outputDecorator) {
+    // The cheap checks of the request run before the first source read. An invalid expected
+    // identifier therefore never triggers a chain-sized copy.
+    UUID uuidExpectedInBackup = null;
+    if (expectedUUID != null) {
+      expectedUUID = expectedUUID.trim();
+
+      if (!expectedUUID.isEmpty()) {
+        try {
+          uuidExpectedInBackup = UUID.fromString(expectedUUID);
+        } catch (IllegalArgumentException e) {
+          LogManager.instance()
+              .error(DiskStorage.class,
+                  "Expected database identifier (UUID) %s of the backup of database '%s' is"
+                      + " incorrect.",
+                  e,
+                  expectedUUID, storageName);
+          throw e;
+        }
+      }
+    }
+
+    // The existing source-specific listing and naming rules select the units of the chain.
+    List<String> ibuFiles;
+    if (expectedUUID != null) {
+      var expectedUUIDString = expectedUUID;
+      ibuFiles = IteratorUtils.list(IteratorUtils.filter(ibuFilesSupplier.get(),
+          fileName -> fileName.startsWith(expectedUUIDString)));
+    } else {
+      ibuFiles = IteratorUtils.list(ibuFilesSupplier.get());
+    }
+    ibuFiles.sort(new IBUFileNamesComparator());
+    validateSelectedUnitNames(storageName, ibuFiles);
+
+    final PreparedBackupChain chain;
+    try {
+      chain = new PreparedBackupChain(storageName,
+          Files.createTempDirectory(storageName + "-ytdb-backup"));
+    } catch (IOException creationFailure) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "Error during restore from backup"), creationFailure,
+          storageName);
+    }
+    LogManager.instance()
+        .info(DiskStorage.class,
+            "Temporary directory for the backup restore of database '%s' created in %s.",
+            storageName, chain.temporaryDirectory().toAbsolutePath());
+
+    try {
+      copyAndValidateChain(chain, ibuFiles, ibuInputStreamSupplier, uuidExpectedInBackup,
+          outputDecorator);
+      return chain;
+    } catch (IOException copyFailure) {
+      var failure = BaseException.wrapException(
+          new StorageException(storageName, "Error during restore from backup"), copyFailure,
+          storageName);
+      chain.closeSuppressing(failure);
+      throw failure;
+    } catch (RuntimeException | Error failure) {
+      // A partial preparation owns temporary copies as well, so the cleanup covers every exit.
+      chain.closeSuppressing(failure);
+      throw failure;
+    }
+  }
+
+  /** Validates every selected name and refuses duplicates before creating any prepared copy. */
+  private static void validateSelectedUnitNames(String storageName, List<String> ibuFiles) {
+    var selectedNames = new HashSet<Path>();
+    for (var ibuFile : ibuFiles) {
+      var bareName = preparedCopyName(storageName, ibuFile);
+      if (!selectedNames.add(bareName)) {
+        throw new UnsupportedBackupException(storageName,
+            "The backup source repeats the unit name '" + ibuFile
+                + "'. The restore refuses duplicate unit names before any copy.");
+      }
+    }
+  }
+
+  /**
+   * Resolves the prepared copy of one selected unit inside the temporary directory.
+   *
+   * <p>The name of one unit comes from the source of the request, and a stream source controls
+   * that name completely. This method therefore accepts one bare file-name component alone. An
+   * absolute name and a name with a directory component both reach a controlled refusal. A name
+   * of one directory reaches that same refusal before any output stream opens.
+   *
+   * @param storageName the database name of the restore request
+   * @param temporaryDirectory the request-owned directory of every prepared copy
+   * @param ibuFile the selected name of one source unit
+   * @throws UnsupportedBackupException when the name escapes the temporary directory
+   */
+  private static Path preparedCopyPath(String storageName, Path temporaryDirectory,
+      String ibuFile) {
+    var bareName = preparedCopyName(storageName, ibuFile);
+    var ownedDirectory = temporaryDirectory.toAbsolutePath().normalize();
+    var preparedCopy = ownedDirectory.resolve(bareName).normalize();
+    // The containment check is the last word. A prepared copy always stays one direct child of
+    // the request-owned directory, so no restore ever writes outside that directory.
+    if (!ownedDirectory.equals(preparedCopy.getParent())) {
+      throw refusedUnitName(storageName, ibuFile);
+    }
+    return preparedCopy;
+  }
+
+  /** Returns one validated bare unit name that a request-owned directory may contain. */
+  private static Path preparedCopyName(String storageName, String ibuFile) {
+    Path candidate;
+    try {
+      candidate = Path.of(ibuFile);
+    } catch (InvalidPathException invalidName) {
+      throw refusedUnitName(storageName, ibuFile);
+    }
+
+    var bareName = candidate.getFileName();
+    if (candidate.isAbsolute()
+        || candidate.getNameCount() != 1
+        || bareName == null
+        || !bareName.toString().equals(ibuFile)) {
+      throw refusedUnitName(storageName, ibuFile);
+    }
+    return bareName;
+  }
+
+  /** Builds the refusal of one source unit name that no prepared copy can own. */
+  private static UnsupportedBackupException refusedUnitName(String storageName, String ibuFile) {
+    return new UnsupportedBackupException(storageName,
+        "The backup source names the unit '" + ibuFile
+            + "', which is no plain backup unit file name. The restore of database '"
+            + storageName + "' refuses that name before any copy of it.");
+  }
+
+  /** Copies every selected unit into the prepared chain and validates the complete chain. */
+  private static void copyAndValidateChain(PreparedBackupChain chain, List<String> ibuFiles,
+      Function<String, InputStream> ibuInputStreamSupplier, @Nullable UUID uuidExpectedInBackup,
+      @Nullable UnaryOperator<OutputStream> outputDecorator) throws IOException {
+    var storageName = chain.storageName();
+    UUID metadataUUID = null;
+    LogSequenceNumber lastLsn = null;
+    long backupLastTxId = -1;
+
+    for (var ibuFile : ibuFiles) {
+      var tmpIBUFile = preparedCopyPath(storageName, chain.temporaryDirectory(), ibuFile);
+
+      var isFullBackup = false;
+      try (var ownedCopyStream = Files.newOutputStream(tmpIBUFile, StandardOpenOption.CREATE_NEW,
+          StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
+        var copyStream = outputDecorator == null
+            ? ownedCopyStream
+            : outputDecorator.apply(ownedCopyStream);
+        try (copyStream; var bufferedCopyStream = new BufferedOutputStream(copyStream)) {
+
+          BackupUnitInspection inspection;
+          try (var ibuStream = ibuInputStreamSupplier.apply(ibuFile)) {
+            inspection = inspectBackupUnit(ibuFile, storageName,
+                uuidExpectedInBackup, ibuStream, bufferedCopyStream);
+          }
+
+          // The two refusals below stay separate. A failed content check names broken content,
+          // even when no expected database identifier can prove that the unit is removable.
+          if (inspection.contentCheckFailed()) {
+            throw new UnsupportedBackupException(storageName, "Backup unit file " + ibuFile
+                + " contains invalid content, restore from this backup is impossible. "
+                + inspection.detail());
+          }
+          if (inspection.classification() == BackupUnitClassification.UNCLASSIFIABLE) {
+            throw new UnsupportedBackupException(storageName, "Backup unit file " + ibuFile
+                + " carries no supported backup header, restore from this backup is impossible. "
+                + inspection.detail());
+          }
+          var backupMetadata = inspection.metadata();
+          if (metadataUUID == null) {
+            metadataUUID = backupMetadata.databaseId;
+          } else if (!metadataUUID.equals(backupMetadata.databaseId)) {
+            throw new DatabaseException(storageName, "Backup unit files from different databases "
+                + "cannot be restored in the same database.");
+          }
+
+          if (lastLsn != null) {
+            if (backupMetadata.startLsn == null) {
+              throw new DatabaseException(storageName,
+                  "There are two full backups in the backup, restore is impossible. ");
+            }
+
+            if (!backupMetadata.startLsn.equals(lastLsn)) {
+              throw new DatabaseException(
+                  "Backup files are not contiguous, some changes are missing, restore is impossible.");
+            }
+          }
+
+          isFullBackup = backupMetadata.startLsn == null;
+          lastLsn = backupMetadata.endLsn;
+          if (backupMetadata.lastTxId > backupLastTxId) {
+            backupLastTxId = backupMetadata.lastTxId;
           }
         }
       }
 
+      chain.addUnit(tmpIBUFile, isFullBackup);
+    }
+
+    if (chain.units().isEmpty()) {
+      throw new DatabaseException(storageName, "No backup unit files found in the backup.");
+    }
+    var firstBackupUnit = chain.units().getFirst();
+    if (!firstBackupUnit.rightBoolean()) {
+      throw new DatabaseException(storageName,
+          "Full backup file is absent in the backup, restore is "
+              + "impossible.");
+    }
+    chain.completePreparation(backupLastTxId);
+  }
+
+  /**
+   * Replays one prepared backup chain into this target and activates the target.
+   *
+   * <p>The caller prepared and validated every copy of the chain before this method runs. This
+   * method therefore performs no source selection and no further copy. The replay consumes the
+   * prepared copies alone, so a change of the source after the preparation never reaches this
+   * target.
+   *
+   * <p>The existing final checks follow the replay. The restored content validation, the
+   * durability barrier, and the activation keep their existing order and their existing scope.
+   */
+  @Override
+  public void restoreFromPreparedBackupChain(PreparedBackupChain chain) {
+    chain.requireComplete();
+    stateLock.writeLock().lock();
+    try {
       final var aesKeyEncoded =
           configuration
               .getContextConfiguration()
@@ -1803,129 +2397,46 @@ public class DiskStorage extends AbstractStorage {
             "Invalid length of the encryption key, provided size is " + aesKey.length);
       }
 
-      List<String> ibuFiles;
+      // A restored image never shares its storage lineage with the backup source. A storage
+      // lineage is the identifier of the ancestry of one storage image. The production restore
+      // path creates a fresh target. The birth publication of that fresh target already
+      // generates a random storage identity and a random storage lineage. The call below is
+      // therefore a no-operation for the production restore path, because the target already
+      // carries the restore-in-progress lifecycle state. The call serves an in-place restore
+      // into an already active storage, which only a test performs today.
+      beginLineageReplacement();
+      var result = preprocessingIncrementalRestore();
+      for (var ibuFilePair : chain.units()) {
+        var ibuPath = ibuFilePair.left();
 
-      if (expectedUUID != null) {
-        var expectedUUIDString = expectedUUID;
-        ibuFiles = IteratorUtils.list(IteratorUtils.filter(ibuFilesSupplier.get(),
-            fileName -> fileName.startsWith(expectedUUIDString)));
-      } else {
-        ibuFiles = IteratorUtils.list(ibuFilesSupplier.get());
-      }
-
-      ibuFiles.sort(new IBUFileNamesComparator());
-      var tempIBUFiles = new ArrayList<ObjectBooleanPair<Path>>(ibuFiles.size());
-      var tmpDirectory = Files.createTempDirectory(name + "-ytdb-backup");
-      LogManager.instance()
-          .info(this, "Temporary directory for backup restore created in %s.",
-              tmpDirectory.toAbsolutePath());
-
-      UUID metadataUUID = null;
-      LogSequenceNumber lastLsn = null;
-      long backupLastTxId = -1;
-      try {
-        for (var ibuFile : ibuFiles) {
-          var tmpIBUFile = tmpDirectory.resolve(ibuFile);
-
-          var isFullBackup = false;
-          try (var copyStream = Files.newOutputStream(tmpIBUFile)) {
-            try (var bufferedCopyStream = new BufferedOutputStream(copyStream)) {
-
-              BackupMetadata backupMetadata = null;
-              try (var ibuStream = ibuInputStreamSupplier.apply(ibuFile)) {
-                backupMetadata = validateFileAndFetchBackupMetadata(ibuFile, getName(),
-                    uuidExpectedInBackup, ibuStream, bufferedCopyStream);
-              }
-
-              if (backupMetadata == null) {
-                throw new DatabaseException(name, "Backup unit file " + ibuFile
-                    + " contains invalid content, restore from this backup is impossible.");
-              }
-              if (metadataUUID == null) {
-                metadataUUID = backupMetadata.databaseId;
-              } else if (!metadataUUID.equals(backupMetadata.databaseId)) {
-                throw new DatabaseException(name, "Backup unit files from different databases "
-                    + "cannot be restored in the same database.");
-              }
-
-              if (lastLsn != null) {
-                if (backupMetadata.startLsn == null) {
-                  throw new DatabaseException(name,
-                      "There are two full backups in the backup, restore is impossible. ");
-                }
-
-                if (!backupMetadata.startLsn.equals(lastLsn)) {
-                  throw new DatabaseException(
-                      "Backup files are not contiguous, some changes are missing, restore is impossible.");
-                }
-              }
-
-              isFullBackup = backupMetadata.startLsn == null;
-              lastLsn = backupMetadata.endLsn;
-              if (backupMetadata.lastTxId > backupLastTxId) {
-                backupLastTxId = backupMetadata.lastTxId;
-              }
-            }
-          }
-
-          tempIBUFiles.add(new ObjectBooleanImmutablePair<>(tmpIBUFile, isFullBackup));
-        }
-
-        if (tempIBUFiles.isEmpty()) {
-          throw new DatabaseException(name, "No backup unit files found in the backup.");
-        }
-        var firstBackupUnit = tempIBUFiles.getFirst();
-        if (!firstBackupUnit.rightBoolean()) {
-          throw new DatabaseException(name,
-              "Full backup file is absent in the backup, restore is "
-                  + "impossible.");
-        }
-
-        // A restored image never shares its storage lineage with the backup source. A storage
-        // lineage is the identifier of the ancestry of one storage image. The production restore
-        // path creates a fresh target. The birth publication of that fresh target already
-        // generates a random storage identity and a random storage lineage. The call below is
-        // therefore a no-operation for the production restore path, because the target already
-        // carries the restore-in-progress lifecycle state. The call serves an in-place restore
-        // into an already active storage, which only a test performs today.
-        beginLineageReplacement();
-        var result = preprocessingIncrementalRestore();
-        for (var ibuFilePair : tempIBUFiles) {
-          var ibuPath = ibuFilePair.left();
-
-          try (var inputStream = Files.newInputStream(ibuPath)) {
-            try (var bufferedInputStream = new BufferedInputStream(inputStream)) {
-              var isFullBackup = ibuFilePair.rightBoolean();
-              restoreFromIncrementalBackup(
-                  result.charset,
-                  result.locale,
-                  result.contextConfiguration,
-                  aesKey,
-                  bufferedInputStream,
-                  isFullBackup);
-            }
+        try (var inputStream = Files.newInputStream(ibuPath)) {
+          try (var bufferedInputStream = new BufferedInputStream(inputStream)) {
+            var isFullBackup = ibuFilePair.rightBoolean();
+            restoreFromIncrementalBackup(
+                result.charset,
+                result.locale,
+                result.contextConfiguration,
+                aesKey,
+                bufferedInputStream,
+                isFullBackup);
           }
         }
-
-        if (backupLastTxId >= 0 && backupLastTxId >= getIdGen().getLastId()) {
-          getIdGen().setStartId(backupLastTxId + 1);
-        }
-
-        postProcessIncrementalRestore(result.contextConfiguration);
-        // Track 24 restore order. The restore target reaches the active lifecycle state only
-        // after the validation of the restored content and after the durability barrier over
-        // that content. A failed validation therefore leaves the restore-in-progress state, and
-        // the destructive restart entry accepts that state.
-        validateRestoredContent();
-        barrierWhileCallerOwnsStateLock();
-        activateBootstrapSnapshot("Cannot activate the restored storage lineage");
-        dropStaleIndexLifecycles();
-      } finally {
-        PathUtils.deleteDirectory(tmpDirectory);
-        LogManager.instance().info(this, "Temporary directory for backup restore %s deleted.",
-            tmpDirectory.toAbsolutePath());
       }
 
+      var backupLastTxId = chain.lastTxId();
+      if (backupLastTxId >= 0 && backupLastTxId >= getIdGen().getLastId()) {
+        getIdGen().setStartId(backupLastTxId + 1);
+      }
+
+      postProcessIncrementalRestore(result.contextConfiguration);
+      // Track 24 restore order. The restore target reaches the active lifecycle state only
+      // after the validation of the restored content and after the durability barrier over
+      // that content. A failed validation therefore leaves the restore-in-progress state, and
+      // the destructive restart entry accepts that state.
+      validateRestoredContent();
+      barrierWhileCallerOwnsStateLock();
+      activateBootstrapSnapshot("Cannot activate the restored storage lineage");
+      dropStaleIndexLifecycles();
     } catch (IOException e) {
       throw BaseException.wrapException(
           new StorageException(name, "Error during restore from backup"), e, name);
@@ -2363,7 +2874,79 @@ public class DiskStorage extends AbstractStorage {
       int sequenceNumber,
       LogSequenceNumber startLsn,
       LogSequenceNumber endLsn,
-      long lastTxId) {
+      long lastTxId,
+      BackupSemanticIdentity semanticIdentity) {
+
+  }
+
+  /**
+   * Names the semantic database format and the creation completion evidence of one backup unit.
+   *
+   * <p>The feature format names the storage features of the backed-up database. The storage layout
+   * version names the on-disk layout of that database. The creation completion evidence states
+   * whether the creation of that database finished.
+   */
+  protected record BackupSemanticIdentity(int featureFormatVersion,
+      int storageLayoutVersion,
+      int creationEvidence) {
+
+  }
+
+  /** Names the three outcomes of one backup unit inspection. */
+  enum BackupUnitClassification {
+    /** The unit passes every header check and every content check. */
+    SUPPORTED,
+    /**
+     * The unit carries the complete supported header of this database and fails a content check.
+     *
+     * <p>Such a unit is incomplete output of an interrupted backup of this build. An incremental
+     * backup removes such trailing output before the backup extends the chain.
+     */
+    RECOGNIZED_INCOMPLETE,
+    /**
+     * This build cannot classify the unit.
+     *
+     * <p>Five cases reach this outcome. An old header and a header of another build reach it.
+     * A header without accepted creation completion evidence reaches it. A file name that
+     * disagrees with the header and unreadable output reach it as well. Such a unit stays in
+     * place forever, because the unit can hold a valuable backup of another build.
+     */
+    UNCLASSIFIABLE
+  }
+
+  /**
+   * Reports the outcome of one backup unit inspection.
+   *
+   * @param metadata the metadata of one supported unit, and null for every rejected unit
+   * @param contentCheckFailed true when the stored hash disagrees with the unit content
+   * @param detail one sentence that names the outcome for a log entry or a failure message
+   */
+  record BackupUnitInspection(BackupUnitClassification classification,
+      @Nullable BackupMetadata metadata,
+      boolean contentCheckFailed,
+      String detail) {
+
+  }
+
+  /**
+   * Reports the trailing header bytes of one read backup unit.
+   *
+   * @param header the trailing header bytes, and null when the read found no header
+   * @param failureDetail one sentence that names the missing header, and null for one header
+   */
+  private record BackupUnitTrailer(@Nullable byte[] header, @Nullable String failureDetail) {
+
+  }
+
+  /**
+   * Reports the inspection result of one existing backup chain.
+   *
+   * @param chainHead the metadata of the newest supported unit, and null for an empty chain
+   * @param removableFiles every recognized incomplete unit above that head, newest first. The
+   *     inspection of the complete chain precedes every removal of these units.
+   */
+  private record ChainExtension(@Nullable BackupMetadata chainHead,
+      List<String> removableFiles) {
 
   }
 

@@ -126,6 +126,7 @@ import com.jetbrains.youtrackdb.internal.core.storage.collection.SnapshotKey;
 import com.jetbrains.youtrackdb.internal.core.storage.collection.VisibilityKey;
 import com.jetbrains.youtrackdb.internal.core.storage.collection.v2.PaginatedCollectionV2;
 import com.jetbrains.youtrackdb.internal.core.storage.config.CollectionBasedStorageConfiguration;
+import com.jetbrains.youtrackdb.internal.core.storage.disk.PreparedBackupChain;
 import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.StorageIdentity;
 import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.StorageLineageIdentity;
 import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.atomicoperations.AtomicOperation;
@@ -8900,6 +8901,17 @@ public abstract class AbstractStorage
 
   public abstract void restoreFromBackup(final Supplier<Iterator<String>> ibuFilesSupplier,
       Function<String, InputStream> ibuInputStreamSupplier, @Nullable String expectedUUID);
+
+  /**
+   * Replays one prepared and validated backup chain into this storage.
+   *
+   * <p>The caller owns the prepared chain. The caller prepared and validated every copy of that
+   * chain before any change of this target. This method therefore selects no source file, copies
+   * no source file, and removes no copy.
+   *
+   * @param chain the prepared copies of one restore request
+   */
+  public abstract void restoreFromPreparedBackupChain(PreparedBackupChain chain);
 
   private void restoreFromBeginning() throws IOException {
     LogManager.instance().info(this, "Data restore procedure is started.");

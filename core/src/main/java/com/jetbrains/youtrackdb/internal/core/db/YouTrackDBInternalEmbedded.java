@@ -48,6 +48,7 @@ import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.Stora
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -77,6 +78,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
@@ -113,6 +115,9 @@ public class YouTrackDBInternalEmbedded implements YouTrackDBInternal {
 
   private volatile long maxWALSegmentSize = -1;
   private volatile long doubleWriteLogMaxSegSize = -1;
+
+  @Nullable private Runnable restartAfterDeletionForTesting;
+  @Nullable private UnaryOperator<OutputStream> preparedCopyOutputDecoratorForTesting;
 
   private final ReentrantLock fileMetadataLock = new ReentrantLock();
 
@@ -821,55 +826,146 @@ public class YouTrackDBInternalEmbedded implements YouTrackDBInternal {
   @Override
   public void restore(String name, String path,
       @Nullable String expectedUUID, YouTrackDBConfig config) {
-    restoreStorage(name, (YouTrackDBConfigImpl) config,
-        storage -> storage.restoreFromBackup(Path.of(path), expectedUUID));
+    var backupDirectory = Path.of(path);
+    restore(name,
+        DiskStorage.localBackupFileNames(name, backupDirectory, expectedUUID),
+        DiskStorage.localBackupFileStreams(name, backupDirectory),
+        expectedUUID,
+        config);
   }
 
   @Override
   public void restore(String name, Supplier<Iterator<String>> ibuFilesSupplier,
       Function<String, InputStream> ibuInputStreamSupplier, @Nullable String expectedUUID,
       YouTrackDBConfig config) {
-    restoreStorage(name, (YouTrackDBConfigImpl) config,
-        storage -> storage.restoreFromBackup(ibuFilesSupplier, ibuInputStreamSupplier,
-            expectedUUID));
+    // The cheap checks of the request run before the chain-sized preparation. An expensive copy
+    // therefore never precedes a known refusal of the target name.
+    requireFreshRestoreAdmission(name);
+    // The preparation runs outside the instance monitor, so a chain-sized copy blocks no other
+    // operation of this manager. The preparation changes no file of the target.
+    try (var prepared =
+        DiskStorage.prepareBackupChain(name, ibuFilesSupplier, ibuInputStreamSupplier,
+            expectedUUID, preparedCopyOutputDecoratorForTesting)) {
+      restoreStorage(name, (YouTrackDBConfigImpl) config,
+          storage -> storage.restoreFromPreparedBackupChain(prepared));
+    }
+  }
+
+  /** Installs one request-scoped prepared-output decorator for deterministic failure tests. */
+  void setPreparedCopyOutputDecoratorForTesting(
+      @Nullable UnaryOperator<OutputStream> outputDecorator) {
+    preparedCopyOutputDecoratorForTesting = outputDecorator;
+  }
+
+  /**
+   * Runs every cheap nonmutating check of one fresh restore before the chain preparation.
+   *
+   * <p>The checks keep the order of the restore itself. The name check runs first, and the target
+   * directory resolution runs next. The existence refusal follows, and the reserved-prefix check
+   * ends the block. No check creates or updates any file, so a refusal leaves every directory
+   * unchanged.
+   *
+   * <p>The restore repeats these checks inside the exclusion that covers the target creation. The
+   * repetition closes the window between this block and that creation.
+   */
+  private void requireFreshRestoreAdmission(String name) {
+    checkDatabaseName(name);
+    resolveDatabaseDirectory(name);
+    synchronized (this) {
+      checkOpen();
+      if (exists(name)) {
+        throw new DatabaseException(basePath.toString(),
+            "Cannot restore database '" + name + "' because it already exists");
+      }
+      checkReservedDatabaseNamePrefixes(name);
+    }
   }
 
   @Override
   public void restartInterruptedRestore(String name, String path,
       @Nullable String expectedUUID, YouTrackDBConfig config) {
+    var backupDirectory = Path.of(path);
+    restartInterruptedRestore(name,
+        DiskStorage.localBackupFileNames(name, backupDirectory, expectedUUID),
+        DiskStorage.localBackupFileStreams(name, backupDirectory),
+        expectedUUID,
+        config);
+  }
+
+  /**
+   * Restarts one interrupted restore from one prepared backup chain of any source form.
+   *
+   * <p>The cheap name checks and the first target-eligibility check precede the preparation. The
+   * preparation then copies and validates the complete chain outside the instance monitor. No
+   * chain-sized work therefore blocks another operation of this manager. No chain-sized work holds
+   * the deletion lock of the target either.
+   *
+   * <p>The instance monitor then covers the destructive part of the restart. That part repeats the
+   * target-eligibility check immediately before the first mutation. The deletion itself repeats
+   * the same check inside the authority lock. The deletion also attempts the existing normal
+   * database lock without waiting, immediately before the removal of the content files. The
+   * in-memory discard of the target therefore stays between the repeated eligibility check and
+   * that lock probe. That order is the existing lock order of the restart.
+   *
+   * <p>The monitor also covers the recreation, the replay of the prepared copies, the final
+   * content checks, and the activation. A competing restart of this manager therefore never shuts
+   * down the target of a running restart.
+   */
+  void restartInterruptedRestore(String name, Supplier<Iterator<String>> ibuFilesSupplier,
+      Function<String, InputStream> ibuInputStreamSupplier, @Nullable String expectedUUID,
+      YouTrackDBConfig config) {
     // Both name checks run before the restart changes anything, and both use the same
     // lower-case rule. A refused name therefore never reaches the deletion of the restart.
     checkDatabaseName(name);
     checkReservedDatabaseNamePrefixes(name);
     var targetPath = resolveDatabaseDirectory(name);
     var solvedConfig = solveConfig((YouTrackDBConfigImpl) config);
-    // One instance monitor covers the acceptance check, the deletion, and the new restore. No
-    // concurrent creation, open, or restart can occupy the name between the deletion and the
-    // new restore, so the name never holds an empty active database.
     synchronized (this) {
       checkOpen();
       // The acceptance check runs before the restart touches any in-memory state. A refused
-      // restart therefore keeps every file and every live session of a healthy database.
+      // restart therefore keeps every file and every live session of a healthy database. The
+      // check creates no authority lock file of an unrelated directory.
       requireInterruptedRestoreTarget(name, targetPath);
-      // The registration of an earlier failed restore attempt of this process leaves now. The
-      // registration would otherwise pin an open storage over the deleted files.
-      discardRestoreTargetRegistration(name, targetPath);
-      try {
-        DiskStorage.deleteInterruptedRestoreTarget(targetPath);
-      } catch (StorageAdmissionException rejection) {
-        throw refusedRestart(name, rejection);
-      } catch (IOException deletionFailure) {
-        throw BaseException.wrapException(
-            new DatabaseException(basePath.toString(),
-                "Cannot delete the interrupted restore target of database '"
-                    + name
-                    + "'"),
-            deletionFailure,
-            basePath.toString());
-      }
-      restoreStorage(name, solvedConfig,
-          storage -> storage.restoreFromBackup(Path.of(path), expectedUUID), true);
     }
+    try (var prepared =
+        DiskStorage.prepareBackupChain(name, ibuFilesSupplier, ibuInputStreamSupplier,
+            expectedUUID)) {
+      // One instance monitor covers the acceptance check, the deletion, and the new restore. No
+      // concurrent creation, open, or restart can occupy the name between the deletion and the
+      // new restore. The name therefore never holds an empty active database.
+      synchronized (this) {
+        checkOpen();
+        // The repeated check runs immediately before the first destructive step. A target that
+        // became a healthy database during the preparation therefore survives the restart.
+        requireInterruptedRestoreTarget(name, targetPath);
+        // The registration of an earlier failed restore attempt of this process leaves now. The
+        // registration would otherwise pin an open storage over the deleted files.
+        discardRestoreTargetRegistration(name, targetPath);
+        try {
+          DiskStorage.deleteInterruptedRestoreTarget(targetPath);
+        } catch (StorageAdmissionException rejection) {
+          throw refusedRestart(name, rejection);
+        } catch (IOException deletionFailure) {
+          throw BaseException.wrapException(
+              new DatabaseException(basePath.toString(),
+                  "Cannot delete the interrupted restore target of database '"
+                      + name
+                      + "'"),
+              deletionFailure,
+              basePath.toString());
+        }
+        if (restartAfterDeletionForTesting != null) {
+          restartAfterDeletionForTesting.run();
+        }
+        restoreStorage(name, solvedConfig,
+            storage -> storage.restoreFromPreparedBackupChain(prepared), true);
+      }
+    }
+  }
+
+  /** Installs one deterministic test action after restart deletion and inside manager exclusion. */
+  void setRestartAfterDeletionForTesting(@Nullable Runnable action) {
+    restartAfterDeletionForTesting = action;
   }
 
   /**

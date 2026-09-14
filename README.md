@@ -44,9 +44,9 @@ YouTrackDB's key features are:
 7. **[Strong security](docs/security.md)**: A strong security profiling system based on user, role,
    and predicate [security policies](docs/yql/YQL-Create-Security-Policy.md).
 8. **Encryption of data at rest**: Optionally encrypts all data stored on disk.
-9. **Online incremental and full backups**: Incremental and full backups run while the database
-   keeps serving reads and writes, requiring only brief internal pauses to establish a
-   consistent recovery point.
+9. **[Online incremental and full backups](docs/backup-restore.md)**: Incremental and full backups
+   run while the database keeps serving reads and writes, requiring only brief internal pauses to
+   establish a consistent recovery point.
 10. **Multiple databases per instance**: A single YouTrackDB instance can host and operate
    several independent databases simultaneously — each with its own storage, schema, and
    security — giving you clean data separation through one unified API.
