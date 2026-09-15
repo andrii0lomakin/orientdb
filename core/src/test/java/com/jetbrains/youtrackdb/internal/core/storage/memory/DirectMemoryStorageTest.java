@@ -120,6 +120,15 @@ public class DirectMemoryStorageTest {
     });
   }
 
+  /** The memory-storage creation path can complete an operation with the ranged table. */
+  @Test
+  public void memoryStorageCompletesAtomicOperationWithRangedTable() throws Exception {
+    withMemoryStorage(
+        storage -> storage.getAtomicOperationsManager().executeInsideAtomicOperation(operation -> {
+          // An empty operation exercises identifier registration and the complete table lifecycle.
+        }));
+  }
+
   // ---------------------------------------------------------------------------
   // getType / getURL
   // ---------------------------------------------------------------------------

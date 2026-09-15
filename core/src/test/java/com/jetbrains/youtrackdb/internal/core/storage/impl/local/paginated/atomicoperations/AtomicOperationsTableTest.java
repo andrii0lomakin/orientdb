@@ -1852,6 +1852,273 @@ public class AtomicOperationsTableTest {
     assertEquals(-1, table.getSegmentEarliestOperationInProgress());
   }
 
+  // ==================== Bounded Range Tests ====================
+
+  /** Large identifier gaps create bounded ranges and preserve every lifecycle transition. */
+  @Test
+  public void largeIdentifierGapsDoNotMaterializeUnusedSlots() {
+    var table = new AtomicOperationsTable(100, 0, 8);
+    var aboveIntGap = 1L << 31;
+    var aboveUnsignedIntGap = 1L << 32;
+
+    table.startOperation(0, 10);
+    table.startOperation(aboveIntGap, 20);
+    table.startOperation(aboveUnsignedIntGap, 30);
+
+    assertEquals(3, table.rangeCount());
+    assertEquals(3, table.storedEntryCount());
+    assertEquals(10, table.getSegmentEarliestOperationInProgress());
+
+    table.commitOperation(0);
+    table.persistOperation(0);
+    table.rollbackOperation(aboveIntGap);
+    table.commitOperation(aboveUnsignedIntGap);
+
+    assertEquals(30, table.getSegmentEarliestNotPersistedOperation());
+    table.persistOperation(aboveUnsignedIntGap);
+    assertEquals(-1, table.getSegmentEarliestNotPersistedOperation());
+  }
+
+  /** A small test capacity forces an adjacent split, including at the identifier ceiling. */
+  @Test
+  public void adjacentRegistrationsSplitWithoutCeilingArithmeticWraparound() {
+    var table = new AtomicOperationsTable(100, Long.MAX_VALUE - 3, 2);
+
+    table.startOperation(Long.MAX_VALUE - 3, 1);
+    table.startOperation(Long.MAX_VALUE - 2, 2);
+    table.startOperation(Long.MAX_VALUE - 1, 3);
+    table.startOperation(Long.MAX_VALUE, 4);
+
+    assertEquals(2, table.rangeCount());
+    assertEquals(4, table.storedEntryCount());
+    var snapshot = table.snapshotAtomicOperationTableState(Long.MAX_VALUE);
+    assertEquals(4, snapshot.inProgressTxs().size());
+    assertTrue(snapshot.inProgressTxs().contains(Long.MAX_VALUE));
+
+    table.commitOperation(Long.MAX_VALUE);
+    table.persistOperation(Long.MAX_VALUE);
+    assertEquals(1, table.getSegmentEarliestOperationInProgress());
+  }
+
+  /** Duplicate and backward registrations fail even when the requested identifier is in a gap. */
+  @Test
+  public void registrationHighWaterRejectsDuplicateAndBackwardIdentifiers() {
+    var table = new AtomicOperationsTable(100, 0, 4);
+    table.startOperation(10, 1);
+    table.startOperation(30, 2);
+
+    assertRegistrationFails(table, 30);
+    assertRegistrationFails(table, 20);
+    assertRegistrationFails(table, 9);
+    assertEquals(2, table.storedEntryCount());
+  }
+
+  /**
+   * Compaction may empty every range, but it must not reset registration monotonicity, and it
+   * must leave no reachable descriptor behind.
+   *
+   * <p>The test repeats the whole cycle of registration, terminal transition and compaction three
+   * times, because a retained empty descriptor could appear only in a later cycle. Each cycle
+   * also jumps far ahead, so each cycle drains a freshly created range. After every cycle the
+   * directory must hold no range and no entry, the compaction must report zero copied
+   * descriptors, and the registration boundary must still reject the drained identifier and its
+   * predecessor.
+   */
+  @Test
+  public void fullDrainPreservesRegistrationHighWater() {
+    var table = new AtomicOperationsTable(100, 0, 4);
+    var operationTs = 5L;
+
+    for (var cycle = 0; cycle < 3; cycle++) {
+      var cycleLabel = "cycle " + cycle;
+      table.startOperation(operationTs, cycle + 1);
+      assertEquals(cycleLabel, 1, table.rangeCount());
+      assertEquals(cycleLabel, 1, table.storedEntryCount());
+
+      table.commitOperation(operationTs);
+      table.persistOperation(operationTs);
+      table.compactTable();
+
+      assertEquals(cycleLabel, 0, table.rangeCount());
+      assertEquals(cycleLabel, 0, table.storedEntryCount());
+      assertEquals(cycleLabel, 0, table.lastCompactedRangeCount());
+      assertRegistrationFails(table, operationTs);
+      assertRegistrationFails(table, operationTs - 1);
+
+      operationTs += 1L << 32;
+    }
+
+    table.startOperation(operationTs, 9);
+    assertEquals(1, table.rangeCount());
+    assertEquals(1, table.storedEntryCount());
+    assertEquals(9, table.getSegmentEarliestOperationInProgress());
+  }
+
+  /** An unregistered identifier between starts remains absent and does not pin compaction. */
+  @Test
+  public void issuedButUnregisteredHoleDoesNotAllocateOrRetainSlack() {
+    var table = new AtomicOperationsTable(100, 0, 4);
+    table.startOperation(0, 1);
+    // Identifier 1 represents a manager start that failed before table registration.
+    table.startOperation(2, 2);
+
+    assertEquals(2, table.rangeCount());
+    assertEquals(2, table.storedEntryCount());
+    table.commitOperation(0);
+    table.persistOperation(0);
+    table.compactTable();
+
+    assertEquals(1, table.rangeCount());
+    assertEquals(1, table.storedEntryCount());
+    assertEquals(2, table.getSegmentEarliestOperationInProgress());
+  }
+
+  /** A cached boundary in a removed range resolves upward to the next retained active entry. */
+  @Test
+  public void cachedBoundaryFallsForwardAcrossCompactedRangeGap() {
+    var table = new AtomicOperationsTable(100, 0, 2);
+    table.startOperation(0, 1);
+    table.startOperation(1L << 32, 2);
+    assertEquals(0, table.snapshotAtomicOperationTableState(Long.MAX_VALUE).minActiveOperationTs());
+
+    table.commitOperation(0);
+    table.persistOperation(0);
+    table.compactTable();
+
+    var snapshot = table.snapshotAtomicOperationTableState(Long.MAX_VALUE);
+    assertEquals(1L << 32, snapshot.minActiveOperationTs());
+    assertEquals(1, snapshot.inProgressTxs().size());
+    assertEquals(2, table.getSegmentEarliestNotPersistedOperation());
+  }
+
+  /** Fragmented and contiguous histories store the same entries regardless of gap magnitude. */
+  @Test
+  public void storageWorkDependsOnEntriesAndRangesInsteadOfIdentifierDistance() {
+    var contiguous = new AtomicOperationsTable(100, 0, 16);
+    var fragmented = new AtomicOperationsTable(100, 0, 16);
+    var fragmentedTs = 0L;
+
+    for (var i = 0; i < 64; i++) {
+      contiguous.startOperation(i, i);
+      fragmented.startOperation(fragmentedTs, i);
+      fragmentedTs += 1L << 32;
+    }
+
+    assertEquals(64, contiguous.storedEntryCount());
+    assertEquals(64, fragmented.storedEntryCount());
+    assertEquals(4, contiguous.rangeCount());
+    assertEquals(64, fragmented.rangeCount());
+    assertEquals(
+        contiguous.snapshotAtomicOperationTableState(Long.MAX_VALUE).inProgressTxs().size(),
+        fragmented.snapshotAtomicOperationTableState(Long.MAX_VALUE).inProgressTxs().size());
+  }
+
+  /**
+   * Compaction work must follow the number of retained range descriptors, not the numerical
+   * distance between identifiers.
+   *
+   * <p>Eight registrations with a gap of two to the power of thirty-two each create their own
+   * range. While the oldest operation stays in progress, compaction must copy all eight
+   * descriptors. After the three oldest operations become terminal, compaction must copy exactly
+   * the five remaining descriptors. The copied descriptor count comes from the table itself, so
+   * the test observes the real compaction work instead of a derived structural count.
+   */
+  @Test
+  public void compactionCopiesOnlyRetainedRangeDescriptors() {
+    // A very large compaction interval keeps automatic compaction out of this test.
+    var table = new AtomicOperationsTable(Integer.MAX_VALUE, 0, 2);
+    var identifiers = new long[8];
+    var operationTs = 0L;
+    for (var index = 0; index < identifiers.length; index++) {
+      identifiers[index] = operationTs;
+      table.startOperation(operationTs, index + 1);
+      operationTs += 1L << 32;
+    }
+    assertEquals(8, table.rangeCount());
+    assertEquals(8, table.storedEntryCount());
+
+    table.compactTable();
+    assertEquals(8, table.lastCompactedRangeCount());
+    assertEquals(8, table.rangeCount());
+
+    for (var index = 0; index < 3; index++) {
+      table.commitOperation(identifiers[index]);
+      table.persistOperation(identifiers[index]);
+    }
+    table.compactTable();
+
+    assertEquals(5, table.lastCompactedRangeCount());
+    assertEquals(5, table.rangeCount());
+    assertEquals(5, table.storedEntryCount());
+    assertEquals(4, table.getSegmentEarliestOperationInProgress());
+  }
+
+  /**
+   * Registration directory work must stay proportional to the number of registrations. It must
+   * not follow the retained history length or the numerical distance between identifiers.
+   *
+   * <p>A package-private observer counts every actual range descriptor read through the directory.
+   * The test covers three history sizes, contiguous ranges, fragmented ranges, and two large gap
+   * magnitudes. Every operation stays in progress, so the complete directory remains retained.
+   *
+   * <p>A full-directory copy and a read-only pre-append scan both add a growing number of observed
+   * descriptor reads. Either defect therefore makes reads per registration grow with history.
+   * The assertion uses actual implementation work and no elapsed-time or JVM-specific metric.
+   */
+  @Test
+  public void registrationDirectoryWorkDoesNotGrowWithHistoryLength() {
+    var sizes = new int[] {256, 1024, 4096};
+    var steps = new long[] {1, 1L << 32, 1L << 40};
+
+    for (var step : steps) {
+      var shortestHistoryWork = directoryReadsPerRegistration(sizes[0], step, 64);
+      for (var sizeIndex = 1; sizeIndex < sizes.length; sizeIndex++) {
+        var size = sizes[sizeIndex];
+        var readsPerRegistration = directoryReadsPerRegistration(size, step, 64);
+        var details = "step " + step + ", size " + size + ", shortest history work "
+            + shortestHistoryWork + ", current work " + readsPerRegistration;
+
+        assertTrue("descriptor work must not grow with retained history: " + details,
+            readsPerRegistration <= 2 * shortestHistoryWork);
+      }
+    }
+
+    var narrowerGapWork = directoryReadsPerRegistration(1024, 1L << 32, 64);
+    var widerGapWork = directoryReadsPerRegistration(1024, 1L << 40, 64);
+    assertTrue("descriptor work must not grow with numeric gap magnitude",
+        widerGapWork <= 2 * narrowerGapWork && narrowerGapWork <= 2 * widerGapWork);
+  }
+
+  /** Registers one retained history and returns its observed directory reads per registration. */
+  private static double directoryReadsPerRegistration(
+      int operationCount, long identifierStep, int rangeCapacity) {
+    var directoryReads = new AtomicLong();
+    var table = new AtomicOperationsTable(
+        Integer.MAX_VALUE, 0, rangeCapacity, directoryReads::incrementAndGet);
+    var operationTs = 0L;
+    for (var index = 0; index < operationCount; index++) {
+      table.startOperation(operationTs, 1);
+      operationTs += identifierStep;
+    }
+
+    // Read the count before structural assertions, because those assertions traverse the table.
+    var observedReads = directoryReads.get();
+    assertEquals(operationCount, table.storedEntryCount());
+    var expectedRangeCount = identifierStep == 1
+        ? (operationCount + rangeCapacity - 1) / rangeCapacity : operationCount;
+    assertEquals(expectedRangeCount, table.rangeCount());
+    return (double) observedReads / operationCount;
+  }
+
+  private static void assertRegistrationFails(AtomicOperationsTable table, long operationTs) {
+    try {
+      table.startOperation(operationTs, 1);
+      fail("Registration should reject identifier " + operationTs);
+    } catch (IllegalStateException expected) {
+      assertTrue(expected.getMessage().contains("registration boundary"));
+    }
+  }
+
   // ==================== Test Helpers ====================
 
   /// Asserts that a snapshot's min/max match the actual min/max of its
