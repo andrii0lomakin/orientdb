@@ -171,6 +171,12 @@ TOKEN:
 	|
 	< DESC: ( "d" | "D" ) ( "e" | "E" ) ( "s" | "S" ) ( "c" | "C" ) >
 	|
+	< NULLS: ( "n" | "N" ) ( "u" | "U" ) ( "l" | "L" ) ( "l" | "L" ) ( "s" | "S" ) >
+	|
+	< FIRST: ( "f" | "F" ) ( "i" | "I" ) ( "r" | "R" ) ( "s" | "S" ) ( "t" | "T" ) >
+	|
+	< LAST: ( "l" | "L" ) ( "a" | "A" ) ( "s" | "S" ) ( "t" | "T" ) >
+	|
 	< FETCHPLAN: ( "f" | "F" ) ( "e" | "E" ) ( "t" | "T" ) ( "c" | "C" ) ( "h" | "H" ) ( "p" | "P" ) ( "l" | "L" ) ( "a" | "A" ) ( "n" | "N" ) >
 	|
 	< RETURN: ( "r" | "R" ) ( "e" | "E" ) ( "t" | "T" ) ( "u" | "U" ) ( "r" | "R" ) ( "n" | "N" ) >
@@ -788,6 +794,14 @@ SQLIdentifier Identifier():
 	token = <METADATA>
 	|
 	token = <COLLATE>
+	|
+	// FIRST/LAST/NULLS are ORDER BY keywords (NULLS FIRST|LAST) but must remain
+	// usable as identifiers so first()/last() and aliases like AS first still parse.
+	token = <FIRST>
+	|
+	token = <LAST>
+	|
+	token = <NULLS>
 	|
 	token = <INDEX>
 	|
@@ -3081,6 +3095,8 @@ SQLOrderBy OrderBy():
                 )
             )
             [ <DESC> { lastItem.type = SQLOrderByItem.DESC; }| <ASC>  { lastItem.type = SQLOrderByItem.ASC; }]
+            [ <NULLS> ( <FIRST> { lastItem.nullOrdering = SQLOrderByItem.NULLS_FIRST; }
+                      | <LAST>  { lastItem.nullOrdering = SQLOrderByItem.NULLS_LAST; } ) ]
             [ <COLLATE> lastItem.collate = Expression() ]
         )
         |
@@ -3103,6 +3119,8 @@ SQLOrderBy OrderBy():
                 )
             )
             [ <DESC> { lastItem.type = SQLOrderByItem.DESC; }| <ASC>  { lastItem.type = SQLOrderByItem.ASC; }]
+            [ <NULLS> ( <FIRST> { lastItem.nullOrdering = SQLOrderByItem.NULLS_FIRST; }
+                      | <LAST>  { lastItem.nullOrdering = SQLOrderByItem.NULLS_LAST; } ) ]
             [ <COLLATE> lastItem.collate = Expression() ]
             <RPAREN>
         )
@@ -3128,6 +3146,8 @@ SQLOrderBy OrderBy():
                     )
                 )
                 [ <DESC> { lastItem.type = SQLOrderByItem.DESC; }| <ASC>  { lastItem.type = SQLOrderByItem.ASC; }]
+                [ <NULLS> ( <FIRST> { lastItem.nullOrdering = SQLOrderByItem.NULLS_FIRST; }
+                          | <LAST>  { lastItem.nullOrdering = SQLOrderByItem.NULLS_LAST; } ) ]
                 [ <COLLATE> lastItem.collate = Expression() ]
             )
             |
@@ -3150,6 +3170,8 @@ SQLOrderBy OrderBy():
                     )
                 )
                 [ <DESC> { lastItem.type = SQLOrderByItem.DESC; }| <ASC>  { lastItem.type = SQLOrderByItem.ASC; }]
+                [ <NULLS> ( <FIRST> { lastItem.nullOrdering = SQLOrderByItem.NULLS_FIRST; }
+                          | <LAST>  { lastItem.nullOrdering = SQLOrderByItem.NULLS_LAST; } ) ]
                 [ <COLLATE> lastItem.collate = Expression() ]
                 <RPAREN>
             )

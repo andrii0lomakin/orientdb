@@ -585,6 +585,25 @@ public class MatchExecutionPlanner {
    */
   public InternalExecutionPlan createExecutionPlan(
       CommandContext context, boolean enableProfiling, boolean useCache) {
+    var scopeSession = context.getDatabaseSession();
+    if (scopeSession == null) {
+      // A context with no session reads no configuration, so there is no placement to scope.
+      return buildExecutionPlan(context, enableProfiling, useCache);
+    }
+    // Bracket the whole build in a null placement scope. The index-ordered traversal freezes a
+    // placement into its step, and the plan published below carries that very pair as its stamp.
+    var placements = scopeSession.getPlanNullPlacements();
+    placements.open();
+    try {
+      return buildExecutionPlan(context, enableProfiling, useCache);
+    } finally {
+      placements.close();
+    }
+  }
+
+  /** Runs the MATCH planning phases inside an open null placement scope. */
+  private InternalExecutionPlan buildExecutionPlan(
+      CommandContext context, boolean enableProfiling, boolean useCache) {
 
     var session = context.getDatabaseSession();
 
@@ -621,7 +640,11 @@ public class MatchExecutionPlanner {
           && statement.executinPlanCanBeCached(session)
           && result.canBeCached()
           && YqlExecutionPlanCache.getLastInvalidation(session) < planningStart) {
-        YqlExecutionPlanCache.put(statement.getOriginalStatement(), result, session);
+        YqlExecutionPlanCache.put(
+            statement.getOriginalStatement(),
+            result,
+            session,
+            session.getPlanNullPlacements().recorded());
       }
       return result;
     }
@@ -835,7 +858,12 @@ public class MatchExecutionPlanner {
         && statement.executinPlanCanBeCached(session)
         && result.canBeCached()
         && YqlExecutionPlanCache.getLastInvalidation(session) < planningStart) {
-      YqlExecutionPlanCache.put(statement.getOriginalStatement(), result, session);
+      // Stamp the plan with the placement this build read, still inside the scope.
+      YqlExecutionPlanCache.put(
+          statement.getOriginalStatement(),
+          result,
+          session,
+          session.getPlanNullPlacements().recorded());
     }
 
     return result;
@@ -5688,6 +5716,8 @@ public class MatchExecutionPlanner {
           candidate.linkBagFieldName(),
           candidate.index(),
           candidate.orderAsc(),
+          candidate.comparisonItem(),
+          candidate.nullsPlacement(),
           edge,
           candidate.limit(),
           candidate.multiSourceMode(),

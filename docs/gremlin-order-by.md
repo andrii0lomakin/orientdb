@@ -149,6 +149,30 @@ var graph = GraphFactory.open(configuration);
 This route outranks only the global setting. An explicit option or the strategy still wins.
 The conformance executions set their order mode through dedicated test fixtures.
 
+## Per-query null placement
+
+Two public parameters set null placement for one traversal source.
+`YTDBQueryConfigParam.orderByNullsPlacementAsc` controls `Order.asc`.
+`YTDBQueryConfigParam.orderByNullsPlacementDesc` controls `Order.desc`.
+
+Both parameters declare `String` as their value type. They accept `FIRST` and `LAST`, with
+case-insensitive matching. Embedded callers can also pass an `OrderByNullsPlacement` enum value.
+YouTrackDB stores that enum value as its portable string name.
+
+```java
+import com.jetbrains.youtrackdb.api.gremlin.tokens.YTDBQueryConfigParam;
+
+var g = graph.traversal()
+    .with(YTDBQueryConfigParam.orderByNullsPlacementAsc, "LAST")
+    .with(YTDBQueryConfigParam.orderByNullsPlacementDesc, "FIRST");
+```
+
+Each parameter overrides the corresponding deployment-wide server setting and its shipped
+value. The shipped values are `FIRST` for ascending order and `LAST` for descending order.
+
+The parameters change only the framework comparators `Order.asc` and `Order.desc`.
+A caller-supplied comparator keeps its own null handling. `Order.shuffle` is also unchanged.
+
 ## Known limitation
 
 One shape loses rows under the including default. The limitation stands in the version that

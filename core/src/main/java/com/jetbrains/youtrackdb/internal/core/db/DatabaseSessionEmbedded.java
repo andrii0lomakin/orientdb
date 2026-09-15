@@ -123,6 +123,8 @@ import com.jetbrains.youtrackdb.internal.core.serialization.serializer.binary.Bi
 import com.jetbrains.youtrackdb.internal.core.serialization.serializer.record.RecordSerializer;
 import com.jetbrains.youtrackdb.internal.core.serialization.serializer.record.binary.RecordSerializerBinary;
 import com.jetbrains.youtrackdb.internal.core.serialization.serializer.record.string.JSONSerializerJackson;
+import com.jetbrains.youtrackdb.internal.core.sql.PlanNullPlacements;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.SQLEngine;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.AbstractExecutionStep;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.AggregateProjectionCalculationStep;
@@ -394,6 +396,14 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
 
   private final Map<String, ResultSet> activeQueries;
   private final int resultSetReportThreshold;
+
+  /**
+   * The null placement resolution shared by one plan build of this session. A plan build opens a
+   * scope on it, every placement read of that build goes through it, and the plan cache stores what
+   * the build read next to the plan it publishes. Thread-confined like the rest of session state.
+   */
+  private final PlanNullPlacements planNullPlacements =
+      new PlanNullPlacements(this::getConfiguration);
 
   // database stats!
   private long loadedRecordsCount;
@@ -924,12 +934,17 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
     // idle lifetime. A query() issued by user code between two next() calls therefore still uses the
     // cache, and an abandoned view never silently disables it for the rest of the transaction.
     tx.enterCacheCode();
+    // One placement resolution serves this whole query: the lookup gate below, the plan build a
+    // populate drives, and the placement a fresh entry freezes. Sharing it is what keeps an entry's
+    // recorded placement equal to the placement its own plan baked in.
+    planNullPlacements.open();
     try {
       if (!cacheEmpty) {
         // Non-empty cache: consult it. On the empty-cache short-circuit this whole block — lookup,
         // the hit handling, and the post-lookup strike re-check — is skipped, and the key is not built
         // here, because lookup() could only miss and isNonCacheable() could only return false.
-        var hit = cache.lookup(key.get(), tx.getMutationVersion());
+        var hit =
+            cache.lookup(key.get(), tx.getMutationVersion(), planNullPlacements::resolve);
         if (hit != null) {
           if (hit.getShape() == CacheableShape.MATCH_TUPLE_MULTI
               && DeltaBuilder.matchMultiStale(hit, tx)) {
@@ -1013,6 +1028,7 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
       // Always release the synchronous-scope guard. A returned view holds no guard of its own; it
       // re-enters the bracket per row during iteration (CachedResultSetView.hasNext), so it cannot
       // leak the depth and an abandoned view no longer disables the cache for the rest of the tx.
+      planNullPlacements.close();
       tx.exitCacheCode();
     }
   }
@@ -1080,6 +1096,10 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
     // Stamp before execution: the LocalResultSet constructor calls plan.start(), so the populate
     // version must be captured first so the delta builder later filters in only post-populate ops.
     var populateMutationVersion = tx.getMutationVersion();
+
+    // Resolve the placement before the execution below builds its plan. The resolver memoizes for
+    // this query, so the plan build reads the very pair the entry freezes and the two cannot differ.
+    var placements = populatePlacements(statement);
 
     var original = executeUncached(statement, args);
     if (!(original instanceof LocalResultSet localResult)) {
@@ -1160,6 +1180,7 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
         plan,
         ctx,
         populateMutationVersion);
+    seedNullPlacement(entry, placements);
     if (matchOrigin != null && statement instanceof SQLMatchStatement match) {
       assert shape == CacheableShape.RECORD : "Pojector installed on a non-RECORD entry";
       entry.setReturnProjector(buildMatchReturnProjector(match, matchOrigin, args));
@@ -1221,6 +1242,10 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
 
     // Stamp BEFORE building/driving the plan so the delta builder later admits only post-populate ops.
     var populateMutationVersion = tx.getMutationVersion();
+
+    // Resolve the placement before the plan build below reads it, for the reason given in
+    // populateAndBuildView: one resolution keeps the entry and its plan on one placement.
+    var placements = populatePlacements(select);
 
     var plan = select.createExecutionPlan(ctx, false);
     if (!(plan instanceof SelectExecutionPlan selectPlan)) {
@@ -1291,6 +1316,7 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
         null,
         null,
         populateMutationVersion);
+    seedNullPlacement(entry, placements);
     entry.setAggregateState(state);
     // put is a no-op if the cap already routed the key non-cacheable during the drive; otherwise it
     // stores the entry. Either way the view below is built directly over this entry's seeded state.
@@ -1327,6 +1353,10 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
     var ctx = freshContext(args);
     // Stamp BEFORE building/driving the plan so the delta builder later admits only post-populate ops.
     var populateMutationVersion = tx.getMutationVersion();
+
+    // Resolve the placement before the plan build below reads it, for the reason given in
+    // populateAndBuildView: one resolution keeps the entry and its plan on one placement.
+    var placements = populatePlacements(select);
 
     var plan = select.createExecutionPlan(ctx, false);
     if (!(plan instanceof SelectExecutionPlan selectPlan)) {
@@ -1386,6 +1416,7 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
         null,
         null,
         populateMutationVersion);
+    seedNullPlacement(entry, placements);
     entry.setAggregateState(state);
     cache.put(resolvedKey, entry);
 
@@ -1521,6 +1552,52 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
         ? DeltaBuilder.buildForRecord(entry, tx, ctx)
         : null;
     return new CachedResultSetView(entry, delta, this, tx, entry.getPlan(), ctx);
+  }
+
+  /**
+   * The null placement a fresh cache entry for {@code statement} must freeze, or {@code null} when
+   * the statement ranks nothing and so cannot go stale on a placement change.
+   *
+   * <p>Call it before the populating execution builds its plan. The session resolver memoizes the
+   * pair for the whole query, so the plan build reads the same pair and the entry can never claim a
+   * placement its own rows were not ordered by.
+   */
+  @Nullable private ResolvedOrderByNullsPlacement populatePlacements(
+      @Nonnull SQLStatement statement) {
+    return rankingOrderBy(statement) == null ? null : planNullPlacements.resolve();
+  }
+
+  /**
+   * Freezes the null placement of a freshly populated cache entry, before any row of it is compared
+   * or served.
+   *
+   * <p>Every later comparison on one served entry then ranks rows the way its frozen rows are
+   * already ranked, and the serve path rejects the entry after a placement change. A statement that
+   * ranks nothing passes {@code null} here and the entry never reads a placement at all.
+   */
+  private static void seedNullPlacement(
+      @Nonnull CachedEntry entry, @Nullable ResolvedOrderByNullsPlacement placements) {
+    if (placements != null) {
+      entry.seedNullsDefault(placements);
+    }
+  }
+
+  /**
+   * The ORDER BY that ranks the rows of a cacheable statement, for every cacheable shape.
+   *
+   * <p>Distinct from {@link #orderByOf}, which reports only the ORDER BY the entry itself replays
+   * through its merge. A multi-alias MATCH ranks its projected tuples but replays them verbatim, so
+   * its entry carries no merge ORDER BY while its rows still depend on the placement. Reading the
+   * statement clause makes the placement gate cover that shape too.
+   */
+  @Nullable private static SQLOrderBy rankingOrderBy(@Nonnull SQLStatement statement) {
+    if (statement instanceof SQLSelectStatement select) {
+      return select.getOrderBy();
+    }
+    if (statement instanceof SQLMatchStatement match) {
+      return match.getOrderBy();
+    }
+    return null;
   }
 
   /** A command context carrying the query's parameter bindings, mirroring the executor's setup. */
@@ -3429,6 +3506,7 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
       // never release
       // a live foreign commit's permit. releaseMetadataWriteMutexForTx never throws by contract.
       releaseMetadataWriteMutexForTx();
+      planNullPlacements.reset();
       internalCloseInProgress = false;
       // ALWAYS RESET TL
       activeSession.remove();
@@ -4226,6 +4304,16 @@ public class DatabaseSessionEmbedded extends ListenerManger<SessionListener>
   public void setValidationEnabled(final boolean iEnabled) {
     assert assertIfNotActive();
     set(ATTRIBUTES_INTERNAL.VALIDATION, iEnabled);
+  }
+
+  /**
+   * The per-build null placement resolution of this session. A planner opens a scope around its
+   * build so every placement read of that build returns one pair, and the plan cache compares the
+   * recorded pair before it serves a stored plan again.
+   */
+  @Nonnull
+  public PlanNullPlacements getPlanNullPlacements() {
+    return planNullPlacements;
   }
 
   @Nullable public ContextConfiguration getConfiguration() {

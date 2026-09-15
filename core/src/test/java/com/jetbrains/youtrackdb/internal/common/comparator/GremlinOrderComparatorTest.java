@@ -3,6 +3,7 @@ package com.jetbrains.youtrackdb.internal.common.comparator;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.ResultInternal;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderByItem;
 import java.lang.reflect.Proxy;
@@ -66,8 +67,9 @@ public class GremlinOrderComparatorTest {
     var unmarked = new SQLOrderByItem();
     unmarked.setAlias("value");
 
-    assertTrue(marked.compare(text, bool, null) > 0);
-    assertEquals(0, unmarked.compare(text, bool, null));
+    assertTrue(marked.compare(text, bool, null, ResolvedOrderByNullsPlacement.SHIPPED) > 0);
+    assertEquals(
+        0, unmarked.compare(text, bool, null, ResolvedOrderByNullsPlacement.SHIPPED));
   }
 
   @Test

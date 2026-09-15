@@ -195,10 +195,15 @@ public final class DeltaBuilder {
     final var orderBy = entry.getOrderBy();
     if (orderBy != null && injectList.size() > 1) {
       final var projector = entry.getReturnProjector();
+      // Null placement comes from the entry, which resolves it once and keeps it. The view merges
+      // this sorted list against the cached rows. A second resolution there could disagree after a
+      // configuration change, and the merged result would come out unsorted.
+      final var nullsDefault = entry.nullsDefault(ctx);
       if (projector == null) {
-        injectList.sort((a, b) -> orderBy.compare(a, b, ctx));
+        injectList.sort((a, b) -> orderBy.compare(a, b, ctx, nullsDefault));
       } else {
-        injectList.sort((a, b) -> orderBy.compare(projector.apply(a), projector.apply(b), ctx));
+        injectList.sort(
+            (a, b) -> orderBy.compare(projector.apply(a), projector.apply(b), ctx, nullsDefault));
       }
     }
 

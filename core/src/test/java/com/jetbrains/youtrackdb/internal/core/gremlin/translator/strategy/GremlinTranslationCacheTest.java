@@ -3,11 +3,17 @@ package com.jetbrains.youtrackdb.internal.core.gremlin.translator.strategy;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
+import com.jetbrains.youtrackdb.api.config.OrderByNullsPlacement;
 import com.jetbrains.youtrackdb.api.gremlin.tokens.YTDBQueryConfigParam;
+import com.jetbrains.youtrackdb.internal.SequentialTest;
 import com.jetbrains.youtrackdb.internal.core.gremlin.GraphBaseTest;
 import com.jetbrains.youtrackdb.internal.core.gremlin.YTDBTransaction;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.YTDBMatchPlanStep;
+import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.YTDBStrategyUtil;
+import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderBy;
+import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderByItem;
 import java.util.List;
+import org.apache.tinkerpop.gremlin.process.traversal.Order;
 import org.apache.tinkerpop.gremlin.process.traversal.P;
 import org.apache.tinkerpop.gremlin.process.traversal.Pop;
 import org.apache.tinkerpop.gremlin.process.traversal.TextP;
@@ -16,23 +22,37 @@ import org.apache.tinkerpop.gremlin.process.traversal.lambda.ConstantTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.strategy.decoration.StandardOrderSemanticsStrategy;
 import org.apache.tinkerpop.gremlin.structure.T;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
 /**
  * Translation-cache (pre-walk shape key) and copy-on-open behaviour: a second {@code has()} value
  * splices the cached template, a declining shape is cached as decline, schema invalidation clears
  * the map, and {@code getPlan()} before the first open is the shared template.
  */
+@Category(SequentialTest.class)
 public class GremlinTranslationCacheTest extends GraphBaseTest {
+
+  private Object previousAscending;
+  private Object previousDescending;
 
   private final TranslatorEquivalenceSupport support =
       new TranslatorEquivalenceSupport(this::graphSession);
 
   @Before
   public void enableTranslator() {
+    previousAscending = GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.getValue();
+    previousDescending = GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_DESC.getValue();
     support.setTranslatorEnabled(true);
     GremlinPlanCache.instance(graphSession()).invalidate();
+  }
+
+  @After
+  public void restoreNullPlacementGlobals() {
+    GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.setValue(previousAscending);
+    GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_DESC.setValue(previousDescending);
   }
 
   /**
@@ -296,6 +316,151 @@ public class GremlinTranslationCacheTest extends GraphBaseTest {
     assertThat(cache.getTranslationMisses()).isEqualTo(missesBefore);
   }
 
+  /** Every global placement combination is written explicitly into converted sort items. */
+  @Test
+  public void allFourGlobalNullPlacementCombinations_reachConvertedItems() {
+    for (var ascending : OrderByNullsPlacement.values()) {
+      for (var descending : OrderByNullsPlacement.values()) {
+        setGlobalNullPlacements(ascending, descending);
+        var orderBy =
+            translatedOrderBy(
+                () -> graph.traversal().V().order().by("age").by("name", Order.desc));
+
+        assertThat(orderBy.getItems())
+            .extracting(SQLOrderByItem::getNullOrdering)
+            .containsExactly(nullOrdering(ascending), nullOrdering(descending));
+      }
+    }
+  }
+
+  /** The ascending per-query option overrides only the converted ascending item. */
+  @Test
+  public void ascendingPerQueryNullPlacement_reachesConvertedItem() {
+    setGlobalNullPlacements(OrderByNullsPlacement.FIRST, OrderByNullsPlacement.LAST);
+
+    var orderBy =
+        translatedOrderBy(
+            () -> graph
+                .traversal()
+                .with(
+                    YTDBQueryConfigParam.orderByNullsPlacementAsc,
+                    OrderByNullsPlacement.LAST)
+                .V()
+                .order()
+                .by("age")
+                .by("name", Order.desc));
+
+    assertThat(orderBy.getItems())
+        .extracting(SQLOrderByItem::getNullOrdering)
+        .containsExactly(SQLOrderByItem.NULLS_LAST, SQLOrderByItem.NULLS_LAST);
+  }
+
+  /** The descending per-query option overrides only the converted descending item. */
+  @Test
+  public void descendingPerQueryNullPlacement_reachesConvertedItem() {
+    setGlobalNullPlacements(OrderByNullsPlacement.FIRST, OrderByNullsPlacement.LAST);
+
+    var orderBy =
+        translatedOrderBy(
+            () -> graph
+                .traversal()
+                .with(
+                    YTDBQueryConfigParam.orderByNullsPlacementDesc,
+                    OrderByNullsPlacement.FIRST)
+                .V()
+                .order()
+                .by("age")
+                .by("name", Order.desc));
+
+    assertThat(orderBy.getItems())
+        .extracting(SQLOrderByItem::getNullOrdering)
+        .containsExactly(SQLOrderByItem.NULLS_FIRST, SQLOrderByItem.NULLS_FIRST);
+  }
+
+  /** Shape-identical traversals with different placements use separate translation entries. */
+  @Test
+  public void nullPlacement_missesTranslationCacheWithinOneLifetime() {
+    graph.addVertex(T.label, "Person", "name", "Alice", "age", 30);
+    graph.addVertex(T.label, "Person", "name", "Nobody");
+    graph.tx().commit();
+
+    var cache = GremlinPlanCache.instance(graphSession());
+    var missesBefore = cache.getTranslationMisses();
+    var hitsBefore = cache.getTranslationHits();
+
+    var first =
+        apply(
+            () -> graph
+                .traversal()
+                .with(
+                    YTDBQueryConfigParam.orderByNullsPlacementAsc,
+                    OrderByNullsPlacement.FIRST)
+                .V()
+                .order()
+                .by("age")
+                .values("name"));
+    assertThat(first).isEqualTo(List.of("Nobody", "Alice"));
+    assertThat(cache.getTranslationMisses()).isEqualTo(missesBefore + 1);
+
+    apply(
+        () -> graph
+            .traversal()
+            .with(
+                YTDBQueryConfigParam.orderByNullsPlacementAsc,
+                OrderByNullsPlacement.FIRST)
+            .V()
+            .order()
+            .by("age")
+            .values("name"));
+    assertThat(cache.getTranslationHits()).isEqualTo(hitsBefore + 1);
+
+    var last =
+        apply(
+            () -> graph
+                .traversal()
+                .with(
+                    YTDBQueryConfigParam.orderByNullsPlacementAsc,
+                    OrderByNullsPlacement.LAST)
+                .V()
+                .order()
+                .by("age")
+                .values("name"));
+    assertThat(last).isEqualTo(List.of("Alice", "Nobody"));
+    assertThat(cache.getTranslationMisses()).isEqualTo(missesBefore + 2);
+  }
+
+  /** Placement changes do not partition a shape without any global order step. */
+  @Test
+  public void nullPlacement_doesNotPartitionShapeWithoutOrder() {
+    setGlobalNullPlacements(OrderByNullsPlacement.FIRST, OrderByNullsPlacement.LAST);
+    var shipped = shapeKey(() -> graph.traversal().V().hasLabel("Person"));
+    setGlobalNullPlacements(OrderByNullsPlacement.LAST, OrderByNullsPlacement.FIRST);
+    var reversed = shapeKey(() -> graph.traversal().V().hasLabel("Person"));
+
+    assertThat(shipped).isEqualTo(reversed);
+  }
+
+  /** A nested union-arm order still partitions the enclosing translation shape. */
+  @Test
+  public void nullPlacement_partitionsShapeForNestedUnionOrder() {
+    setGlobalNullPlacements(OrderByNullsPlacement.FIRST, OrderByNullsPlacement.LAST);
+    var shipped =
+        rawShapeKey(
+            () -> graph
+                .traversal()
+                .V()
+                .union(__.order().by("age"), __.identity()));
+    setGlobalNullPlacements(OrderByNullsPlacement.LAST, OrderByNullsPlacement.FIRST);
+    var reversed =
+        rawShapeKey(
+            () -> graph
+                .traversal()
+                .V()
+                .union(__.order().by("age"), __.identity()));
+
+    assertThat(shipped).isNotEqualTo(reversed);
+  }
+
   /** The per-session polymorphism flag is part of the shape key; toggling it must split entries. */
   @Test
   public void polymorphismFlag_discriminatesShapeKeys() {
@@ -484,12 +649,45 @@ public class GremlinTranslationCacheTest extends GraphBaseTest {
         .containsExactly("Bob");
   }
 
+  private SQLOrderBy translatedOrderBy(
+      java.util.function.Supplier<
+          org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversal<?, ?>> supplier) {
+    var admin = supplier.get().asAdmin();
+    var placements = YTDBStrategyUtil.orderByNullsPlacements(admin);
+    assertThat(placements).isNotNull();
+    var translation =
+        GremlinToMatchTranslator.translate(
+            admin, YTDBStrategyUtil.orderIncludesMissingKey(admin), placements);
+    assertThat(translation).isNotNull();
+    assertThat(translation.inputs()).isNotNull();
+    assertThat(translation.inputs().orderBy()).isNotNull();
+    return translation.inputs().orderBy();
+  }
+
+  private static void setGlobalNullPlacements(
+      OrderByNullsPlacement ascending, OrderByNullsPlacement descending) {
+    GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.setValue(ascending);
+    GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_DESC.setValue(descending);
+  }
+
+  private static String nullOrdering(OrderByNullsPlacement placement) {
+    return placement == OrderByNullsPlacement.FIRST
+        ? SQLOrderByItem.NULLS_FIRST
+        : SQLOrderByItem.NULLS_LAST;
+  }
+
   private String shapeKey(
       java.util.function.Supplier<
           org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversal<?, ?>> supplier) {
     var extraction = GremlinStepWalker.extractShape(supplier.get().asAdmin(), graphSession());
     assertThat(extraction.complete()).isTrue();
     return extraction.key();
+  }
+
+  private String rawShapeKey(
+      java.util.function.Supplier<
+          org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversal<?, ?>> supplier) {
+    return GremlinStepWalker.extractShape(supplier.get().asAdmin(), graphSession()).key();
   }
 
   private List<?> apply(

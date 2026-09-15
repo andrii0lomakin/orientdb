@@ -11,6 +11,7 @@ import com.jetbrains.youtrackdb.internal.core.index.IndexDefinition;
 import com.jetbrains.youtrackdb.internal.core.index.IndexDefinitionMultiValue;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.Collate;
 import com.jetbrains.youtrackdb.internal.core.query.Result;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.Pattern;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLAndBlock;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLBaseExpression;
@@ -82,6 +83,8 @@ public final class IndexOrderedPlanner {
       String linkBagFieldName,
       Index index,
       boolean orderAsc,
+      @Nonnull SQLOrderByItem comparisonItem,
+      @Nonnull ResolvedOrderByNullsPlacement nullsPlacement,
       long limit,
       @Nullable MultiSourceMode multiSourceMode,
       @Nullable String reverseFieldName,
@@ -436,8 +439,16 @@ public final class IndexOrderedPlanner {
       }
     }
 
-    // 10. Determine sort direction and query LIMIT
+    // 10. Fix the comparison and null placement in the plan. The comparison item addresses the
+    //     target record directly because projection aliases are unavailable in local fallback sorts.
     var orderAsc = SQLOrderByItem.ASC.equals(orderItem.getType());
+    var comparisonItem = new SQLOrderByItem();
+    comparisonItem.setRecordAttr(propertyName);
+    comparisonItem.setType(orderItem.getType());
+    comparisonItem.setNullOrdering(orderItem.getNullOrdering());
+    // Read the placement through the session's plan-build scope, so this frozen pair is the pair the
+    // plan cache stamps on the finished plan.
+    var nullsPlacement = context.getDatabaseSession().getPlanNullPlacements().resolve();
     long skipSize = skip != null && skip.getValue(context) >= 0
         ? skip.getValue(context) : 0;
     long limitSize = limit != null && limit.getValue(context) >= 0
@@ -504,7 +515,7 @@ public final class IndexOrderedPlanner {
 
     return new IndexOrderedCandidate(
         matchedEdge, sourceAlias, targetAlias, edgeClassName,
-        linkBagFieldName, matchedIndex, orderAsc, queryLimit,
+        linkBagFieldName, matchedIndex, orderAsc, comparisonItem, nullsPlacement, queryLimit,
         multiSourceMode, reverseFieldName, sourceClassName,
         multiFieldOrderBy, targetFilter, targetClassName, isEdgeTraversal,
         downstreamEdgeCount, ridTieBreakAccepted);

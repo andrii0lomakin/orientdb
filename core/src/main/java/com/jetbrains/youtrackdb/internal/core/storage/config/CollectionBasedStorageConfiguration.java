@@ -1033,7 +1033,7 @@ public final class CollectionBasedStorageConfiguration implements StorageConfigu
 
       if (cfg != null) {
         final var value =
-            serializeStringValue(cfg.isHidden() ? null : configuration.getValueAsString(cfg));
+            serializeStringValue(cfg.isHidden() ? null : storedFormOf(cfg));
         totalSize += value.length;
         entries.add(value);
       } else {
@@ -1075,13 +1075,74 @@ public final class CollectionBasedStorageConfiguration implements StorageConfigu
       final var cfg = GlobalConfiguration.findByKey(key);
       if (cfg != null) {
         if (value != null) {
-          configuration.setValue(key, PropertyTypeInternal.convert(null, value, cfg.getType()));
+          if (cfg.getType().isEnum()) {
+            // Enum-typed keys are parsed here instead of by PropertyTypeInternal.convert, which has
+            // no enum branch and would throw, failing the whole open. The shared helper stays
+            // untouched because a query-level conversion method reaches it too.
+            final var constant = parseEnumValue(cfg, value);
+            if (constant == null) {
+              // Tolerant only for enums. An unreadable constant name leaves the global default in
+              // force instead of making the database unopenable. Every other type still fails the
+              // open loudly, below. The value is skipped, so the next clean close writes only the
+              // effective configuration and the stored text is gone from then on.
+              LogManager.instance()
+                  .warn(
+                      this,
+                      "Database '"
+                          + storage.getName()
+                          + "' stores the unreadable value '"
+                          + value
+                          + "' for the configuration key '"
+                          + key
+                          + "'. The global default applies instead. The next clean close of this"
+                          + " database drops the stored value.");
+            } else {
+              configuration.setValue(key, constant);
+            }
+          } else {
+            configuration.setValue(key, PropertyTypeInternal.convert(null, value, cfg.getType()));
+          }
         }
       } else {
         LogManager.instance()
             .warn(this, "Ignored storage configuration because not supported: %s=%s", key, value);
       }
     }
+  }
+
+  /**
+   * Resolves a stored string to a constant of an enum-typed configuration key. Names are matched
+   * ignoring case, which is the rule {@link GlobalConfiguration#setValue} applies. Surrounding
+   * whitespace is not tolerated, for the same reason. A value the setter accepts therefore reads
+   * back, and a value the setter rejects is rejected here too.
+   *
+   * @return the matching constant, or {@code null} when the value names no constant
+   */
+  @Nullable private static Object parseEnumValue(final GlobalConfiguration cfg,
+      final String value) {
+    for (final var constant : cfg.getType().getEnumConstants()) {
+      if (((Enum<?>) constant).name().equalsIgnoreCase(value)) {
+        return constant;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Renders the effective value of one configuration key for storage.
+   *
+   * <p>An enum is written by constant name, because the load path matches constant names. Consider a
+   * future constant whose text form differs from its name. Writing that text form would produce a
+   * value the load path cannot match, and the setting would disappear on reopen.
+   *
+   * @return the text to persist, or {@code null} when the key holds no value
+   */
+  @Nullable private String storedFormOf(final GlobalConfiguration cfg) {
+    final var value = configuration.getValue(cfg);
+    if (value instanceof Enum<?> constant) {
+      return constant.name();
+    }
+    return value == null ? null : value.toString();
   }
 
   public void setCreationVersion(final AtomicOperation atomicOperation, final String version) {

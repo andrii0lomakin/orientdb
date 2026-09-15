@@ -3,6 +3,7 @@ package com.jetbrains.youtrackdb.internal.core.gremlin.translator.strategy;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.BoundaryOutputType;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.PostConcatOp;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.ResultShaping;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.MatchPlanInputs;
 import java.util.List;
 import java.util.Map;
@@ -67,6 +68,15 @@ final class GremlinToMatchTranslator {
   @Nullable static TranslationResult translate(
       Traversal.Admin<?, ?> traversal, @Nullable Boolean orderIncludesMissingKey) {
     return GremlinStepWalker.production().walk(traversal, orderIncludesMissingKey);
+  }
+
+  /** Translates with every order setting already resolved by the strategy. */
+  @Nullable static TranslationResult translate(
+      Traversal.Admin<?, ?> traversal,
+      @Nullable Boolean orderIncludesMissingKey,
+      @Nonnull ResolvedOrderByNullsPlacement orderByNullsPlacements) {
+    return GremlinStepWalker.production()
+        .walk(traversal, orderIncludesMissingKey, orderByNullsPlacements);
   }
 
   /**

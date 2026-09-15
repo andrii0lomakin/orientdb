@@ -75,6 +75,25 @@ public class DeleteEdgeExecutionPlanner {
 
   public InternalExecutionPlan createExecutionPlan(
       CommandContext ctx, boolean enableProfiling, boolean useCache) {
+    var scopeSession = ctx.getDatabaseSession();
+    if (scopeSession == null) {
+      // A context with no session reads no configuration, so there is no placement to scope.
+      return buildExecutionPlan(ctx, enableProfiling, useCache);
+    }
+    // Bracket the build in a null placement scope so a nested plan built for a source subquery keeps
+    // its placement recorded until this plan is published with it as its stamp.
+    var placements = scopeSession.getPlanNullPlacements();
+    placements.open();
+    try {
+      return buildExecutionPlan(ctx, enableProfiling, useCache);
+    } finally {
+      placements.close();
+    }
+  }
+
+  /** Runs the planning pipeline inside an open null placement scope. */
+  private InternalExecutionPlan buildExecutionPlan(
+      CommandContext ctx, boolean enableProfiling, boolean useCache) {
     var db = ctx.getDatabaseSession();
     if (useCache && !enableProfiling && statement.executinPlanCanBeCached(db)) {
       var plan = YqlExecutionPlanCache.get(statement.getOriginalStatement(), ctx, db);
@@ -139,8 +158,9 @@ public class DeleteEdgeExecutionPlanner {
         && this.statement.executinPlanCanBeCached(db)
         && result.canBeCached()
         && YqlExecutionPlanCache.getLastInvalidation(db) < planningStart) {
-      YqlExecutionPlanCache.put(this.statement.getOriginalStatement(), result,
-          ctx.getDatabaseSession());
+      YqlExecutionPlanCache.put(
+          this.statement.getOriginalStatement(), result, db,
+          db.getPlanNullPlacements().recorded());
     }
 
     return result;

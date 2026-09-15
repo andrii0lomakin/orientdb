@@ -37,10 +37,11 @@ public class RidFilteredIndexValuesStep extends FetchFromIndexValuesStep {
   public RidFilteredIndexValuesStep(
       IndexSearchDescriptor desc,
       boolean orderAsc,
+      boolean nullsFirst,
       CommandContext ctx,
       boolean profilingEnabled,
       @Nullable RidSet ridFilter) {
-    super(desc, orderAsc, ctx, profilingEnabled);
+    super(desc, orderAsc, nullsFirst, ctx, profilingEnabled);
     this.ridFilter = ridFilter;
   }
 
@@ -59,7 +60,8 @@ public class RidFilteredIndexValuesStep extends FetchFromIndexValuesStep {
     var tx = session.getTransactionInternal();
     tx.preProcessRecordsAndExecuteCallCallbacks();
 
-    List<Stream<RawPair<Object, RID>>> streams = init(desc, isOrderAsc(), ctx);
+    List<Stream<RawPair<Object, RID>>> streams =
+        init(desc, isOrderAsc(), isNullsFirst(), ctx);
     var filter = this.ridFilter;
     var res =
         new ExecutionStreamProducer() {

@@ -19,6 +19,7 @@ import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimiz
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBGraphMatchStepStrategy;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBGraphStepStrategy;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBOrderCollationStrategy;
+import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBOrderNullsStrategy;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBOrderRidTieBreakStrategy;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBStandardOrderSemanticsStrategy;
 import com.jetbrains.youtrackdb.internal.core.id.RecordIdInternal;
@@ -78,13 +79,14 @@ public abstract class YTDBGraphImplAbstract implements YTDBGraphInternal, Consum
             .addStrategies(
                 // Position in this list is informational — the strategy resolver topologically
                 // sorts by each strategy's applyPrior()/applyPost(). Tie-break names the translator
-                // in applyPost(), so ORDER BY steps gain by(T.id) before translation; the four
-                // strategies below the translator name it in applyPrior() and become the decline
-                // fallback. Collation is one of those four: a translated shape has no order() step
-                // left to modulate, and the engine comparison applies the declared collation
-                // instead. RepeatDeclineStrategy is the one entry that is not a provider
-                // optimization: it is a decoration strategy, and the resolver's category ordering
-                // is what puts it ahead of TinkerPop's RepeatUnrollStrategy.
+                // in applyPost(), so ORDER BY steps gain by(T.id) before translation. Strategies
+                // below the translator name it in applyPrior() and become the decline fallback.
+                // Collation applies through engine comparison after translation. OrderNulls waits
+                // on the translator, record identifier tie-break, and standard-order strategy. Its
+                // wrapping hits only native-decline order() steps after their final slots and
+                // missing-key behavior are known. RepeatDeclineStrategy is the one
+                // entry that is not a provider optimization. It is a decoration strategy, and
+                // category ordering puts it before RepeatUnrollStrategy.
                 RepeatDeclineStrategy.instance(),
                 YTDBOrderRidTieBreakStrategy.instance(),
                 GremlinToMatchStrategy.instance(),
@@ -97,6 +99,7 @@ public abstract class YTDBGraphImplAbstract implements YTDBGraphInternal, Consum
                 // whole process, so a registration gated on configuration would freeze the
                 // decision at first class load. The strategy reads the setting in its own apply().
                 YTDBStandardOrderSemanticsStrategy.instance(),
+                YTDBOrderNullsStrategy.instance(),
                 YTDBQueryMetricsStrategy.instance()));
   }
 

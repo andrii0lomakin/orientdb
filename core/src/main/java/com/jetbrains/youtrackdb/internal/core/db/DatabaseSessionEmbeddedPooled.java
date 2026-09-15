@@ -55,6 +55,7 @@ public class DatabaseSessionEmbeddedPooled extends DatabaseSessionEmbedded imple
     // borrow must be able to claim its own teardown.
     clearTeardownIntent();
     resetTeardownClaim();
+    getPlanNullPlacements().reset();
     setStatus(STATUS.OPEN);
   }
 

@@ -42,11 +42,12 @@ public class YTDBGraphTraversalSourceDSL extends GraphTraversalSource {
   }
 
   public YTDBGraphTraversalSource with(final YTDBQueryConfigParam key, final Object value) {
-    if (!key.type().isInstance(value)) {
-      throw new IllegalArgumentException("The provided value " + value + " is not an instance of "
-          + key.type().getSimpleName());
+    if (!key.accepts(value)) {
+      throw new IllegalArgumentException(
+          "Invalid value '" + value + "' for parameter '" + key.name() + "'. "
+              + key.validationDescription());
     }
-    return (YTDBGraphTraversalSource) with(key.name(), value);
+    return (YTDBGraphTraversalSource) with(key.name(), key.normalizeValue(value));
   }
 
   public YTDBGraphTraversalSource with(final YTDBQueryConfigParam key) {

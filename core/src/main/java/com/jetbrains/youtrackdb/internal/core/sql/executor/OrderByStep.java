@@ -6,6 +6,7 @@ import com.jetbrains.youtrackdb.internal.core.command.CommandContext;
 import com.jetbrains.youtrackdb.internal.core.exception.CommandExecutionException;
 import com.jetbrains.youtrackdb.internal.core.query.ExecutionStep;
 import com.jetbrains.youtrackdb.internal.core.query.Result;
+import com.jetbrains.youtrackdb.internal.core.sql.OrderByNullsUtil;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.resultset.ExecutionStream;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderBy;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderByItem;
@@ -201,9 +202,14 @@ public class OrderByStep extends AbstractExecutionStep {
                 + GlobalConfiguration.QUERY_MAX_HEAP_ELEMENTS_ALLOWED_PER_OP.getKey()
                 + " to increase this limit");
       }
+      // Null placement is fixed for the whole scan, exactly like the early-termination flag below.
+      // Resolving per comparison would take a storage read lock on every null-involved compare. A
+      // configuration change mid-sort would also break the comparator contract.
+      var nullsDefault = OrderByNullsUtil.resolvePlacementsForSort(ctx);
+
       // Reversed comparator: peek() returns the element that sorts LAST (worst in top-N).
       var heap = new PriorityQueue<Result>(
-          maxResults, (a, b) -> orderBy.compare(b, a, ctx));
+          maxResults, (a, b) -> orderBy.compare(b, a, ctx, nullsDefault));
 
       // Early-termination eligibility is fixed for the whole scan:
       // IndexOrderedEdgeStep sets VAR_INDEX_ORDERED_PRE_SORTED before this step
@@ -230,13 +236,13 @@ public class OrderByStep extends AbstractExecutionStep {
         // when the fallback (unsorted) path was taken, cutoff is unsafe.
         if (earlyTerminationEnabled
             && heap.size() >= maxResults
-            && primaryKeySortedInput.compare(item, heap.peek(), ctx) > 0) {
+            && primaryKeySortedInput.compare(item, heap.peek(), ctx, nullsDefault) > 0) {
           break;
         }
 
         if (heap.size() < maxResults) {
           heap.offer(item);
-        } else if (orderBy.compare(item, heap.peek(), ctx) < 0) {
+        } else if (orderBy.compare(item, heap.peek(), ctx, nullsDefault) < 0) {
           heap.poll();
           heap.offer(item);
         }
@@ -261,6 +267,8 @@ public class OrderByStep extends AbstractExecutionStep {
     var maxElementsAllowed =
         GlobalConfiguration.QUERY_MAX_HEAP_ELEMENTS_ALLOWED_PER_OP.getValueAsLong();
     List<Result> cachedResult = new ArrayList<>();
+    // Fix placement when the sort starts, before a potentially long upstream drain.
+    var nullsDefault = OrderByNullsUtil.resolvePlacementsForSort(ctx);
     try {
       while (upstream.hasNext(ctx)) {
         if (timeoutMillis > 0 && timeoutBegin + timeoutMillis < System.currentTimeMillis()) {
@@ -277,7 +285,7 @@ public class OrderByStep extends AbstractExecutionStep {
                   + " to increase this limit");
         }
       }
-      cachedResult.sort((a, b) -> orderBy.compare(a, b, ctx));
+      cachedResult.sort((a, b) -> orderBy.compare(a, b, ctx, nullsDefault));
       return cachedResult;
     } finally {
       upstream.close(ctx);

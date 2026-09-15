@@ -1,14 +1,17 @@
 package com.jetbrains.youtrackdb.internal.core.sql.parser;
 
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.common.comparator.GremlinOrderComparator;
 import com.jetbrains.youtrackdb.internal.common.log.LogManager;
 import com.jetbrains.youtrackdb.internal.core.command.CommandContext;
+import com.jetbrains.youtrackdb.internal.core.config.ContextConfiguration;
 import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
 import com.jetbrains.youtrackdb.internal.core.db.record.record.Direction;
 import com.jetbrains.youtrackdb.internal.core.db.record.record.Vertex;
 import com.jetbrains.youtrackdb.internal.core.exception.CommandExecutionException;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.Collate;
 import com.jetbrains.youtrackdb.internal.core.query.Result;
+import com.jetbrains.youtrackdb.internal.core.sql.OrderByNullsUtil;
 import com.jetbrains.youtrackdb.internal.core.sql.SQLEngine;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.ResultInternal;
 import java.util.Locale;
@@ -40,11 +43,21 @@ public class SQLOrderByItem {
 
   public static final String ASC = "ASC";
   public static final String DESC = "DESC";
+  /** Explicit {@code NULLS FIRST} on this ORDER BY item (absolute placement). */
+  public static final String NULLS_FIRST = "NULLS FIRST";
+  /** Explicit {@code NULLS LAST} on this ORDER BY item (absolute placement). */
+  public static final String NULLS_LAST = "NULLS LAST";
+
   protected String alias;
   protected SQLModifier modifier;
   protected String recordAttr;
   protected SQLRid rid;
   protected String type = ASC;
+  /**
+   * Explicit null ordering from the grammar ({@link #NULLS_FIRST}, {@link #NULLS_LAST}), or
+   * {@code null} when omitted. The direction-specific configuration then applies.
+   */
+  @Nullable protected String nullOrdering;
   protected SQLExpression collate;
 
   // calculated at run time
@@ -78,6 +91,14 @@ public class SQLOrderByItem {
     this.type = type;
   }
 
+  @Nullable public String getNullOrdering() {
+    return nullOrdering;
+  }
+
+  public void setNullOrdering(@Nullable String nullOrdering) {
+    this.nullOrdering = nullOrdering;
+  }
+
   public String getRecordAttr() {
     return recordAttr;
   }
@@ -92,6 +113,39 @@ public class SQLOrderByItem {
 
   public void setRid(SQLRid rid) {
     this.rid = rid;
+  }
+
+  /**
+   * Resolves whether nulls should sort before non-nulls for this item using the runtime global
+   * default only. Prefer {@link #resolveNullsFirst(ContextConfiguration)} when a session or storage
+   * configuration is available.
+   */
+  public boolean resolveNullsFirst() {
+    return resolveNullsFirst((ContextConfiguration) null);
+  }
+
+  /**
+   * Resolves whether nulls should sort before non-nulls for this item.
+   *
+   * <p>An explicit clause wins. Otherwise the direction-specific setting is read from {@code
+   * config} when present, then from the runtime global.
+   */
+  public boolean resolveNullsFirst(@Nullable ContextConfiguration config) {
+    return OrderByNullsUtil.resolveNullsFirst(nullOrdering, !DESC.equals(type), config);
+  }
+
+  /**
+   * Resolves whether nulls should sort before non-nulls for this item from a default that the caller
+   * already resolved for the whole sort. No configuration is read here, so every comparison of one
+   * sort sees the same placement.
+   *
+   * <p>The name differs from {@link #resolveNullsFirst(ContextConfiguration)} on purpose. Two
+   * single-argument overloads would make a {@code null} literal argument ambiguous for callers.
+   *
+   * @param nullsDefault the default resolved once at the start of the sort
+   */
+  public boolean nullsFirstFor(ResolvedOrderByNullsPlacement nullsDefault) {
+    return OrderByNullsUtil.composeNullsFirst(nullOrdering, !DESC.equals(type), nullsDefault);
   }
 
   public void toString(Map<Object, Object> params, StringBuilder builder) {
@@ -109,13 +163,24 @@ public class SQLOrderByItem {
     if (type != null) {
       builder.append(" ").append(type);
     }
+    if (nullOrdering != null) {
+      builder.append(" ").append(nullOrdering);
+    }
     if (collate != null) {
       builder.append(" COLLATE ");
       collate.toString(params, builder);
     }
   }
 
-  public int compare(Result a, Result b, CommandContext ctx) {
+  /**
+   * Compares two rows by this sort key.
+   *
+   * @param nullsDefault the null-placement default resolved once for the whole sort (see {@link
+   *     OrderByNullsUtil#resolvePlacementsForSort}). It is a parameter rather than a per-comparison
+   *     read for two reasons. A change in the middle of a sort would break the comparator contract,
+   *     and the read takes a storage lock.
+   */
+  public int compare(Result a, Result b, CommandContext ctx, ResolvedOrderByNullsPlacement nullsDefault) {
     Object aVal = null;
     Object bVal = null;
     if (rid != null) {
@@ -179,16 +244,26 @@ public class SQLOrderByItem {
       }
     }
 
+    // Null placement is absolute once resolved (explicit clause or global default composed with
+    // ASC/DESC). Apply it before ASC/DESC flipping of non-null comparisons so NULLS FIRST/LAST
+    // stay independent of direction, and so COLLATE agrees with the non-collate path.
+    if (aVal == null || bVal == null) {
+      if (aVal == null && bVal == null) {
+        return 0;
+      }
+      var nullsFirst = nullsFirstFor(nullsDefault);
+      if (aVal == null) {
+        return nullsFirst ? -1 : 1;
+      }
+      return nullsFirst ? 1 : -1;
+    }
+
     // One comparison rule for every value class, text included: the collation that governs this
     // item. Text used to take a session-locale Collator instead, which made an undeclared property
     // order by locale rules here and by code point on the native Gremlin pipeline and in every
     // index, so one query answered up to three different sequences.
     var comparison = comparisonCollate();
-    if (aVal == null) {
-      result = bVal == null ? 0 : -1;
-    } else if (bVal == null) {
-      result = 1;
-    } else if (gremlinToMatchTranslatorProduced && collateStrategy == null
+    if (gremlinToMatchTranslatorProduced && collateStrategy == null
         && declaredCollate == null) {
       result = GremlinOrderComparator.INSTANCE.compare(aVal, bVal);
     } else if ((aVal instanceof Comparable && bVal instanceof Comparable)
@@ -253,6 +328,7 @@ public class SQLOrderByItem {
     result.recordAttr = recordAttr;
     result.rid = rid == null ? null : rid.copy();
     result.type = type;
+    result.nullOrdering = nullOrdering;
     result.collate = this.collate == null ? null : collate.copy();
     result.isEdge = this.isEdge;
     result.gremlinToMatchTranslatorProduced = this.gremlinToMatchTranslatorProduced;
@@ -297,6 +373,7 @@ public class SQLOrderByItem {
       result.setProperty("rid", rid.serialize(session));
     }
     result.setProperty("type", type);
+    result.setProperty("nullOrdering", nullOrdering);
     if (collate != null) {
       result.setProperty("collate", collate.serialize(session));
     }
@@ -315,6 +392,12 @@ public class SQLOrderByItem {
       rid.deserialize(fromResult.getProperty("rid"));
     }
     type = DESC.equals(fromResult.getProperty("type")) ? DESC : ASC;
+    var storedNullOrdering = fromResult.<String>getProperty("nullOrdering");
+    if (NULLS_FIRST.equals(storedNullOrdering) || NULLS_LAST.equals(storedNullOrdering)) {
+      nullOrdering = storedNullOrdering;
+    } else {
+      nullOrdering = null;
+    }
     if (fromResult.getProperty("collate") != null) {
       collate = new SQLExpression(-1);
       collate.deserialize(fromResult.getProperty("collate"));
@@ -347,6 +430,9 @@ public class SQLOrderByItem {
     if (!Objects.equals(type, that.type)) {
       return false;
     }
+    if (!Objects.equals(nullOrdering, that.nullOrdering)) {
+      return false;
+    }
     return Objects.equals(collate, that.collate);
   }
 
@@ -357,6 +443,7 @@ public class SQLOrderByItem {
     result = 31 * result + (recordAttr != null ? recordAttr.hashCode() : 0);
     result = 31 * result + (rid != null ? rid.hashCode() : 0);
     result = 31 * result + (type != null ? type.hashCode() : 0);
+    result = 31 * result + (nullOrdering != null ? nullOrdering.hashCode() : 0);
     result = 31 * result + (collate != null ? collate.hashCode() : 0);
     return result;
   }
@@ -379,6 +466,9 @@ public class SQLOrderByItem {
     }
     if (type != null) {
       builder.append(" ").append(type);
+    }
+    if (nullOrdering != null) {
+      builder.append(" ").append(nullOrdering);
     }
     if (collate != null) {
       builder.append(" COLLATE ");

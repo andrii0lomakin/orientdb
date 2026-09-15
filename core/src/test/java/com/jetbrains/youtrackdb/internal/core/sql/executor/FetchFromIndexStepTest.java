@@ -153,6 +153,7 @@ public class FetchFromIndexStepTest extends TestUtilsFixture {
     assertThat(copy.getDesc()).isSameAs(desc);
     assertThat(copy.getIndexName()).isEqualTo(original.getIndexName());
     assertThat(copy.isOrderAsc()).isEqualTo(original.isOrderAsc());
+    assertThat(copy.isNullsFirst()).isEqualTo(original.isNullsFirst());
     // Profiling-enabled contract: copy() carries the flag through, surfaced via prettyPrint's
     // cost suffix. A mutation hard-coding `false` in the copy would drop the suffix. (TB3.)
     assertThat(copy.prettyPrint(0, 2)).isEqualTo(original.prettyPrint(0, 2));
@@ -312,6 +313,44 @@ public class FetchFromIndexStepTest extends TestUtilsFixture {
 
     assertThat(results).hasSize(2);
     assertThat(keys(results)).containsExactly(10, 20);
+  }
+
+  /**
+   * A full ASCENDING scan with {@code nullsFirst=false} emits null keys AFTER the ascending
+   * non-null keys. This is the absolute {@code NULLS LAST} placement, independent of ASC.
+   */
+  @Test
+  public void fullScanAscendingWithNullsLastEmitsNullKeyEntriesLast() {
+    var fixture = createIndexedClass();
+    var index = getIndex(fixture.indexName);
+    seed(fixture.className, 10, 20);
+    seedNull(fixture.className, 2);
+    var ctx = newContext();
+    var step = new FetchFromIndexStep(new IndexSearchDescriptor(index), true, false, ctx, false);
+
+    var results = startAndDrain(step, ctx);
+
+    assertThat(keys(results)).containsExactly(10, 20, null, null);
+    assertThat(step.isNullsFirst()).isFalse();
+  }
+
+  /**
+   * A full DESCENDING scan with {@code nullsFirst=true} emits null keys BEFORE the descending
+   * non-null keys. This is the absolute {@code NULLS FIRST} placement, independent of DESC.
+   */
+  @Test
+  public void fullScanDescendingWithNullsFirstEmitsNullKeyEntriesFirst() {
+    var fixture = createIndexedClass();
+    var index = getIndex(fixture.indexName);
+    seed(fixture.className, 10, 20);
+    seedNull(fixture.className, 2);
+    var ctx = newContext();
+    var step = new FetchFromIndexStep(new IndexSearchDescriptor(index), false, true, ctx, false);
+
+    var results = startAndDrain(step, ctx);
+
+    assertThat(keys(results)).containsExactly(null, null, 20, 10);
+    assertThat(step.isNullsFirst()).isTrue();
   }
 
   /**
@@ -1098,6 +1137,41 @@ public class FetchFromIndexStepTest extends TestUtilsFixture {
 
     assertThat((Object) serialized.getProperty("condition")).isNull();
     assertThat((Object) serialized.getProperty("additionalRangeCondition")).isNull();
+  }
+
+  /**
+   * Serialized plans carry {@code nullsFirst}; legacy blobs without it fall back to {@code orderAsc}
+   * (FIRST semantic).
+   */
+  @Test
+  public void deserializeRestoresNullsFirstAndFallsBackWhenOmitted() {
+    var fixture = createIndexedClass();
+    var index = getIndex(fixture.indexName);
+    var ctx = newContext();
+    var original =
+        new FetchFromIndexStep(new IndexSearchDescriptor(index), true, false, ctx, false);
+
+    var serialized = (ResultInternal) original.serialize(session);
+    assertThat(serialized.<Boolean>getProperty("nullsFirst")).isFalse();
+
+    var copy = new FetchFromIndexStep(null, true, ctx, false);
+    copy.reset();
+    copy.deserialize(serialized, session);
+    assertThat(copy.isOrderAsc()).isTrue();
+    assertThat(copy.isNullsFirst()).isFalse();
+
+    serialized.setProperty("nullsFirst", null);
+    var legacy = new FetchFromIndexStep(null, true, ctx, false);
+    legacy.reset();
+    legacy.deserialize(serialized, session);
+    assertThat(legacy.isNullsFirst()).isTrue();
+
+    serialized.setProperty("orderAsc", false);
+    serialized.setProperty("nullsFirst", null);
+    var legacyDesc = new FetchFromIndexStep(null, false, ctx, false);
+    legacyDesc.reset();
+    legacyDesc.deserialize(serialized, session);
+    assertThat(legacyDesc.isNullsFirst()).isFalse();
   }
 
   /**

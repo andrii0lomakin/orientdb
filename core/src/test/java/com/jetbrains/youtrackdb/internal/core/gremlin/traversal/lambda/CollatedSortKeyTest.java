@@ -1,8 +1,15 @@
 package com.jetbrains.youtrackdb.internal.core.gremlin.traversal.lambda;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.Collate;
+import java.util.HashMap;
+import org.apache.tinkerpop.gremlin.process.traversal.lambda.ConstantTraversal;
+import org.apache.tinkerpop.gremlin.process.traversal.traverser.B_O_Traverser;
+import org.apache.tinkerpop.gremlin.structure.Element;
+import org.apache.tinkerpop.gremlin.structure.Property;
 import org.junit.Test;
 
 /**
@@ -53,15 +60,44 @@ public class CollatedSortKeyTest {
     assertThat(ada).isGreaterThan(bob);
   }
 
-  /** A null value sorts before every value, as it does in the engine comparison. */
+  /** A null map value projects as a real null, so the order comparator handles its placement. */
   @Test
-  public void compareTo_nullValue_sortsFirst() {
-    var absent = CollatedSortKey.of(null, CASE_INSENSITIVE);
-    var present = CollatedSortKey.of("ada", CASE_INSENSITIVE);
+  public void traversal_nullMapValue_producesRealNull() {
+    var row = new HashMap<String, Object>();
+    row.put("name", null);
+    var traversal = new CollatedSortKeyTraversal<HashMap<String, Object>>(
+        "name", CASE_INSENSITIVE);
 
-    assertThat(absent).isLessThan(present);
-    assertThat(present).isGreaterThan(absent);
-    assertThat(absent).isEqualByComparingTo(CollatedSortKey.of(null, CASE_INSENSITIVE));
+    traversal.addStart(new B_O_Traverser<>(row, 1L));
+
+    assertThat(traversal.next()).isNull();
+  }
+
+  /** A present null element property projects as a real null before collation. */
+  @Test
+  public void traversal_nullElementProperty_producesRealNull() {
+    var element = mock(Element.class);
+    @SuppressWarnings("unchecked")
+    var property = (Property<Object>) mock(Property.class);
+    when(element.property("name")).thenReturn(property);
+    when(property.isPresent()).thenReturn(true);
+    when(property.value()).thenReturn(null);
+    var traversal = new CollatedSortKeyTraversal<Element>("name", CASE_INSENSITIVE);
+
+    traversal.addStart(new B_O_Traverser<>(element, 1L));
+
+    assertThat(traversal.next()).isNull();
+  }
+
+  /** A productive bypass that returns null also projects a real null before collation. */
+  @Test
+  public void traversal_nullBypassValue_producesRealNull() {
+    var traversal = new CollatedSortKeyTraversal<Object>("name", CASE_INSENSITIVE);
+    traversal.setBypassTraversal(new ConstantTraversal<>(null));
+
+    traversal.addStart(new B_O_Traverser<>("ignored", 1L));
+
+    assertThat(traversal.next()).isNull();
   }
 
   /**
@@ -94,13 +130,6 @@ public class CollatedSortKeyTest {
     assertThat(CollatedSortKey.of("ada", CASE_INSENSITIVE))
         .isNotEqualTo(CollatedSortKey.of("ada", DEFAULT))
         .isNotEqualTo("ada");
-  }
-
-  /** A null value hashes to zero rather than throwing, and renders as the collation of nothing. */
-  @Test
-  public void hashCode_nullValue_isZero() {
-    assertThat(CollatedSortKey.of(null, CASE_INSENSITIVE).hashCode()).isZero();
-    assertThat(CollatedSortKey.of(null, CASE_INSENSITIVE)).hasToString("ci(null)");
   }
 
   /** The text form names the collation and the value, so a shape key stays stable across runs. */

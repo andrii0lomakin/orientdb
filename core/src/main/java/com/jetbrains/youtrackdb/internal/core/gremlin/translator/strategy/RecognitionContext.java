@@ -4,6 +4,7 @@ import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.BoundaryOu
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.ListShapingOp;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.PostConcatOp;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.ResultShaping;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.builder.MatchPatternBuilder;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLExpression;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLGroupBy;
@@ -90,6 +91,9 @@ interface RecognitionContext extends ParamSink {
    * place that turns this flag into an emission decision.
    */
   boolean orderIncludesMissingKey();
+
+  /** The direction-specific null placements resolved once for this translation. */
+  ResolvedOrderByNullsPlacement orderByNullsPlacements();
 
   // --- Boundary read ----------------------------------------------------------------------------
 

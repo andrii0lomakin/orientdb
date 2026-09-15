@@ -3,6 +3,7 @@ package com.jetbrains.youtrackdb.internal.core.gremlin.translator.strategy;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.BoundaryOutputType;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.ListShapingOp;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.ResultShaping;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.builder.MatchPatternBuilder;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.builder.MatchWhereBuilder;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLExpression;
@@ -223,6 +224,11 @@ final class SubTraversalPredicateAdapter implements RecognitionContext {
   @Override
   public boolean orderIncludesMissingKey() {
     return parent.orderIncludesMissingKey();
+  }
+
+  @Override
+  public ResolvedOrderByNullsPlacement orderByNullsPlacements() {
+    return parent.orderByNullsPlacements();
   }
 
   @Nullable @Override

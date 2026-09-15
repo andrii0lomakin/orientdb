@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import org.apache.tinkerpop.gremlin.process.traversal.Traverser;
 import org.apache.tinkerpop.gremlin.process.traversal.lambda.AbstractLambdaTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.lambda.ValueTraversal;
@@ -37,7 +38,7 @@ public final class CollatedSortKeyTraversal<S> extends AbstractLambdaTraversal<S
   private final Collate collate;
 
   /** The projection of the most recent start, read back by {@link #next()}. */
-  private CollatedSortKey key;
+  @Nullable private CollatedSortKey key;
 
   /** {@code true} when the most recent start carried no such property — see the class Javadoc. */
   private boolean noStarts;
@@ -58,7 +59,7 @@ public final class CollatedSortKeyTraversal<S> extends AbstractLambdaTraversal<S
   }
 
   @Override
-  public CollatedSortKey next() {
+  public @Nullable CollatedSortKey next() {
     if (noStarts) {
       throw new NoSuchElementException(this + " is empty");
     }
@@ -81,7 +82,7 @@ public final class CollatedSortKeyTraversal<S> extends AbstractLambdaTraversal<S
       // cast that fails on the first row.
       Iterator<?> values = TraversalUtil.applyAll(start, bypassTraversal);
       if (values.hasNext()) {
-        key = CollatedSortKey.of(values.next(), collate);
+        key = collate(values.next());
       } else {
         noStarts = true;
       }
@@ -91,20 +92,25 @@ public final class CollatedSortKeyTraversal<S> extends AbstractLambdaTraversal<S
     if (value instanceof Element element) {
       var property = element.property(propertyKey);
       if (property.isPresent()) {
-        key = CollatedSortKey.of(property.value(), collate);
+        key = collate(property.value());
       } else {
         noStarts = true;
       }
     } else if (value instanceof Map<?, ?> map) {
       // A map row has no absent-key drop: reading a missing key yields null, which is what
       // ValueTraversal does with the same row.
-      key = CollatedSortKey.of(map.get(propertyKey), collate);
+      key = collate(map.get(propertyKey));
     } else {
       throw new IllegalStateException(
           "The by(\"" + propertyKey + "\") modulator can only be applied to a traverser that is an"
               + " Element or a Map - it is being applied to [" + value + "] a "
               + (value == null ? "null" : value.getClass().getSimpleName()) + " class instead");
     }
+  }
+
+  /** Returns a real null so the order comparator places nulls before applying collation. */
+  @Nullable private CollatedSortKey collate(@Nullable Object value) {
+    return value == null ? null : CollatedSortKey.of(value, collate);
   }
 
   @Override

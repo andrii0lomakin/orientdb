@@ -22,6 +22,15 @@ public class FetchFromIndexValuesStep extends FetchFromIndexStep {
     super(desc, orderAsc, ctx, profilingEnabled);
   }
 
+  public FetchFromIndexValuesStep(
+      IndexSearchDescriptor desc,
+      boolean orderAsc,
+      boolean nullsFirst,
+      CommandContext ctx,
+      boolean profilingEnabled) {
+    super(desc, orderAsc, nullsFirst, ctx, profilingEnabled);
+  }
+
   @Override
   public String prettyPrint(int depth, int indent) {
     if (isOrderAsc()) {

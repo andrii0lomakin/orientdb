@@ -276,7 +276,8 @@ public final class CachedResultSetView implements ResultSet {
       // the replay cannot mirror).
       var orderBy = entry.getOrderBy();
       if (orderBy != null && rows.size() > 1) {
-        rows.sort((a, b) -> orderBy.compare(a, b, ctx));
+        var nullsDefault = entry.nullsDefault(ctx);
+        rows.sort((a, b) -> orderBy.compare(a, b, ctx, nullsDefault));
       }
       distinctRows = rows;
     }
@@ -400,8 +401,11 @@ public final class CachedResultSetView implements ResultSet {
       // identical. With an ORDER BY and a returnProjector, both heads are projected before the
       // comparison so a projected ORDER BY column (e.g. u.name) resolves and the comparator ranks on the
       // projected value, not the raw record.
+      // The entry owns the null placement, so the merge ranks rows exactly as the delta builder
+      // sorted the inject list. The cache fixed that placement when it populated the entry. A view
+      // without an ORDER BY never asks for it, which keeps a storage read off that path.
       var cmp = orderBy == null ? -1 : orderBy.compare(projectForCompare(deltaHead),
-          projectCacheHeadForCompare(cacheHead), ctx);
+          projectCacheHeadForCompare(cacheHead), ctx, entry.nullsDefault(ctx));
       if (cmp <= 0) {
         return project(delta.advanceInject());
       }

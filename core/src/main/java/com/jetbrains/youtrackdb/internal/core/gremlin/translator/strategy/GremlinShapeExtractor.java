@@ -3,6 +3,7 @@ package com.jetbrains.youtrackdb.internal.core.gremlin.translator.strategy;
 import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.lambda.RecordIdSortKeyTraversal;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.YTDBStrategyUtil;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -14,6 +15,7 @@ import org.apache.tinkerpop.gremlin.process.traversal.lambda.IdentityTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.lambda.TokenTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.lambda.ValueTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.step.TraversalParent;
+import org.apache.tinkerpop.gremlin.process.traversal.step.map.OrderGlobalStep;
 import org.apache.tinkerpop.gremlin.process.traversal.strategy.optimization.ProductiveByStrategy;
 import org.apache.tinkerpop.gremlin.process.traversal.strategy.verification.EdgeLabelVerificationStrategy;
 
@@ -25,10 +27,11 @@ import org.apache.tinkerpop.gremlin.process.traversal.strategy.verification.Edge
  * {@code false} from {@link StepRecogniser#contributeShape}, or a lambda modulator the extractor
  * cannot name, marks the extraction incomplete so {@code apply} will not cache a {@code Translate}.
  *
- * <p>The key opens with the strategy-flag section, which carries every resolved setting that
- * changes the emitted plan for one and the same step sequence: polymorphism ({@code poly}), edge
- * label verification ({@code elv}), the productive-order setting ({@code oim}) and upstream
- * {@code ProductiveByStrategy}'s productive keys ({@code pb}).
+ * <p>The key opens with the strategy-flag section. It carries every resolved setting that changes
+ * the emitted plan for one step sequence. The section includes polymorphism ({@code poly}), edge
+ * label verification ({@code elv}), and the productive-order setting ({@code oim}). It includes
+ * resolved null placements ({@code onp}) only when a global order step can embed them. It also
+ * includes upstream {@code ProductiveByStrategy}'s productive keys ({@code pb}).
  *
  * <p>Lambda {@code by()} modulators ({@link ValueTraversal}, {@link TokenTraversal}, {@link
  * IdentityTraversal}, {@link RecordIdSortKeyTraversal}) have an empty step list; their property key
@@ -64,11 +67,13 @@ final class GremlinShapeExtractor {
       @Nonnull Set<Class<?>> transparentSteps,
       @Nonnull Traversal.Admin<?, ?> traversal,
       @Nonnull DatabaseSessionEmbedded session,
-      @Nullable Boolean orderIncludesMissingKey) {
+      @Nullable Boolean orderIncludesMissingKey,
+      @Nonnull ResolvedOrderByNullsPlacement orderByNullsPlacements) {
     var extractor =
         new GremlinShapeExtractor(
             recognisers, transparentSteps, new GremlinShapeEncoder(session.getSchema()));
-    extractor.appendStrategyFlags(traversal, orderIncludesMissingKey);
+    extractor.appendStrategyFlags(
+        traversal, orderIncludesMissingKey, orderByNullsPlacements);
     extractor.visit(traversal);
     return new Extraction(extractor.encoder.key(), extractor.encoder.bindings(),
         extractor.encoder.complete());
@@ -78,7 +83,9 @@ final class GremlinShapeExtractor {
   }
 
   private void appendStrategyFlags(
-      Traversal.Admin<?, ?> traversal, @Nullable Boolean orderIncludesMissingKey) {
+      Traversal.Admin<?, ?> traversal,
+      @Nullable Boolean orderIncludesMissingKey,
+      ResolvedOrderByNullsPlacement orderByNullsPlacements) {
     Boolean polymorphic = YTDBStrategyUtil.isPolymorphic(traversal);
     encoder.appendToken("poly", polymorphic == null ? "n" : (polymorphic ? "1" : "0"));
     encoder.appendToken(
@@ -99,6 +106,15 @@ final class GremlinShapeExtractor {
     encoder.appendToken(
         "oim",
         orderIncludesMissingKey == null ? "n" : (orderIncludesMissingKey ? "1" : "0"));
+    // Only a global order step can embed these values in a translated plan. Search every child
+    // because union arms and other nested traversals are encoded into the same shape key.
+    if (containsGlobalOrder(traversal)) {
+      encoder.appendToken(
+          "onp",
+          orderByNullsPlacements.ascending().name()
+              + "/"
+              + orderByNullsPlacements.descending().name());
+    }
     if (productiveKeys == null) {
       encoder.appendToken("pb", "-");
     } else {
@@ -107,6 +123,27 @@ final class GremlinShapeExtractor {
         encoder.appendToken(key);
       }
     }
+  }
+
+  private static boolean containsGlobalOrder(Traversal.Admin<?, ?> traversal) {
+    for (Step<?, ?> step : traversal.getSteps()) {
+      if (step instanceof OrderGlobalStep) {
+        return true;
+      }
+      if (step instanceof TraversalParent parent) {
+        for (var child : parent.getLocalChildren()) {
+          if (containsGlobalOrder(child.asAdmin())) {
+            return true;
+          }
+        }
+        for (var child : parent.getGlobalChildren()) {
+          if (containsGlobalOrder(child.asAdmin())) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
   }
 
   private void visit(Traversal.Admin<?, ?> traversal) {

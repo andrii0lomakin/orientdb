@@ -203,7 +203,7 @@ final class GremlinPlanFingerprint {
    * {@code toGenericStatement}): {@link com.jetbrains.youtrackdb.internal.core.sql.parser.SQLNumber}
    * collapses every integer to {@code ?}, which would let {@code limit(2)} and {@code limit(5)}
    * collide. Group / order / unwind keep {@code toGenericStatement} — their discriminators are
-   * property names and directions, not rebound literals.
+   * property names, directions, and explicit null placements, not rebound literals.
    */
   private static void appendResultShaping(StringBuilder sb, MatchPlanInputs inputs) {
     sb.append(";G:");

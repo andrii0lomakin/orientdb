@@ -40,6 +40,25 @@ public class CreateEdgeExecutionPlanner {
 
   public InsertExecutionPlan createExecutionPlan(
       CommandContext ctx, boolean enableProfiling, boolean useCache) {
+    var scopeSession = ctx.getDatabaseSession();
+    if (scopeSession == null) {
+      // A context with no session reads no configuration, so there is no placement to scope.
+      return buildExecutionPlan(ctx, enableProfiling, useCache);
+    }
+    // Bracket the build in a null placement scope so a nested plan built for a source subquery keeps
+    // its placement recorded until this plan is published with it as its stamp.
+    var placements = scopeSession.getPlanNullPlacements();
+    placements.open();
+    try {
+      return buildExecutionPlan(ctx, enableProfiling, useCache);
+    } finally {
+      placements.close();
+    }
+  }
+
+  /** Runs the planning pipeline inside an open null placement scope. */
+  private InsertExecutionPlan buildExecutionPlan(
+      CommandContext ctx, boolean enableProfiling, boolean useCache) {
     var session = ctx.getDatabaseSession();
     if (useCache && !enableProfiling && statement.executinPlanCanBeCached(session)) {
       var plan = YqlExecutionPlanCache.get(statement.getOriginalStatement(), ctx, session);
@@ -123,7 +142,9 @@ public class CreateEdgeExecutionPlanner {
         && statement.executinPlanCanBeCached(session)
         && result.canBeCached()
         && YqlExecutionPlanCache.getLastInvalidation(session) < planningStart) {
-      YqlExecutionPlanCache.put(statement.getOriginalStatement(), result, ctx.getDatabaseSession());
+      YqlExecutionPlanCache.put(
+          statement.getOriginalStatement(), result, session,
+          session.getPlanNullPlacements().recorded());
     }
 
     return result;

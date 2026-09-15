@@ -116,11 +116,29 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
   /** Sort direction for the index scan (true = ascending, false = descending). */
   private boolean orderAsc;
 
+  /**
+   * Whether null-key index entries are emitted before non-null keys. Independent of {@link
+   * #orderAsc} when the ORDER BY item specifies {@code NULLS FIRST}/{@code NULLS LAST}; otherwise
+   * derived from the direction-specific setting. Legacy call sites that omit this flag use the
+   * shipped placement for their direction.
+   */
+  private boolean nullsFirst;
+
   public FetchFromIndexStep(
       IndexSearchDescriptor desc, boolean orderAsc, CommandContext ctx, boolean profilingEnabled) {
+    this(desc, orderAsc, orderAsc, ctx, profilingEnabled);
+  }
+
+  public FetchFromIndexStep(
+      IndexSearchDescriptor desc,
+      boolean orderAsc,
+      boolean nullsFirst,
+      CommandContext ctx,
+      boolean profilingEnabled) {
     super(ctx, profilingEnabled);
     this.desc = desc;
     this.orderAsc = orderAsc;
+    this.nullsFirst = nullsFirst;
   }
 
   @Override
@@ -134,7 +152,7 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
     var tx = session.getTransactionInternal();
     tx.preProcessRecordsAndExecuteCallCallbacks();
 
-    var streams = init(desc, orderAsc, ctx);
+    var streams = init(desc, orderAsc, nullsFirst, ctx);
     var res =
         new ExecutionStreamProducer() {
           private final Iterator<Stream<RawPair<Object, RID>>> iter = streams.iterator();
@@ -199,6 +217,15 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
    */
   static List<Stream<RawPair<Object, RID>>> init(
       IndexSearchDescriptor desc, boolean isOrderAsc, CommandContext ctx) {
+    return init(desc, isOrderAsc, isOrderAsc, ctx);
+  }
+
+  /**
+   * Same as {@link #init(IndexSearchDescriptor, boolean, CommandContext)} with an explicit null-key
+   * placement ({@code nullsFirst}).
+   */
+  static List<Stream<RawPair<Object, RID>>> init(
+      IndexSearchDescriptor desc, boolean isOrderAsc, boolean nullsFirst, CommandContext ctx) {
 
     var index = desc.getIndex();
     var condition = desc.getKeyCondition();
@@ -208,7 +235,7 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
       return Collections.emptyList();
     }
     return switch (condition) {
-      case null -> processFlatIteration(ctx.getDatabaseSession(), index, isOrderAsc);
+      case null -> processFlatIteration(ctx.getDatabaseSession(), index, isOrderAsc, nullsFirst);
       case SQLAndBlock ignored ->
           processAndBlock(index, condition, additionalRangeCondition, isOrderAsc, ctx);
       default -> throw new CommandExecutionException(ctx.getDatabaseSession(),
@@ -248,22 +275,21 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
 
   /**
    * Full index scan (no key condition). Concatenates the null-key entries (if the index stores
-   * them) with the sorted B-tree entries, placing the null group so that it matches the
-   * in-memory sort's "null = smallest" semantic (see {@link
-   * com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderByItem#compare}):
+   * them) with the sorted B-tree entries, placing the null group according to {@code nullsFirst}:
    *
    * <pre>
-   *  ASC  -> null keys first, then ascending B-tree entries
-   *  DESC -> descending B-tree entries first, then null keys last
+   *  nullsFirst == true  -> null keys first, then B-tree entries (ASC or DESC stream)
+   *  nullsFirst == false -> B-tree entries first, then null keys last
    * </pre>
    *
    * <p>Null keys are physically stored in a separate bucket outside the sorted B-tree, so their
    * position in the emitted sequence is decided purely by where the null stream is concatenated.
-   * The old code always prepended the null stream, which put nulls first for DESC too and
-   * diverged from the in-memory path.
+   * Callers resolve {@code nullsFirst} from the ORDER BY item. An explicit clause wins over the
+   * direction-specific setting. Legacy callers that pass {@code nullsFirst == isOrderAsc}
+   * reproduce the shipped placements.
    */
   private static List<Stream<RawPair<Object, RID>>> processFlatIteration(
-      DatabaseSessionEmbedded session, Index index, boolean isOrderAsc) {
+      DatabaseSessionEmbedded session, Index index, boolean isOrderAsc, boolean nullsFirst) {
     List<Stream<RawPair<Object, RID>>> streams = new ArrayList<>();
     Set<Stream<RawPair<Object, RID>>> acquiredStreams =
         Collections.newSetFromMap(new IdentityHashMap<>());
@@ -289,7 +315,7 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
       throw e;
     }
 
-    if (isOrderAsc) {
+    if (nullsFirst) {
       addStreamIfNew(nullStream, streams, acquiredStreams);
       addStreamIfNew(mainStream, streams, acquiredStreams);
     } else {
@@ -710,6 +736,10 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
     return orderAsc;
   }
 
+  protected boolean isNullsFirst() {
+    return nullsFirst;
+  }
+
   /** Extracts the lower bound key values from the AND block conditions. */
   private static SQLCollection indexKeyFrom(SQLAndBlock keyCondition,
       SQLBinaryCondition additional) {
@@ -864,6 +894,7 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
           "additionalRangeCondition", desc.getAdditionalRangeCondition().serialize(session));
     }
     result.setProperty("orderAsc", orderAsc);
+    result.setProperty("nullsFirst", nullsFirst);
     return result;
   }
 
@@ -885,6 +916,9 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
       var index = session.getSharedContext().getIndexManager().getIndex(indexName);
       desc = new IndexSearchDescriptor(index, condition, additionalRangeCondition, null);
       orderAsc = fromResult.getProperty("orderAsc");
+      Boolean storedNullsFirst = fromResult.getProperty("nullsFirst");
+      // Pre-feature serialized plans omit nullsFirst. Use the shipped placement for the direction.
+      nullsFirst = storedNullsFirst != null ? storedNullsFirst : orderAsc;
     } catch (Exception e) {
       throw BaseException.wrapException(new CommandExecutionException(session, ""), e, session);
     }
@@ -911,7 +945,7 @@ public class FetchFromIndexStep extends AbstractExecutionStep {
 
   @Override
   public ExecutionStep copy(CommandContext ctx) {
-    return new FetchFromIndexStep(desc, this.orderAsc, ctx, this.profilingEnabled);
+    return new FetchFromIndexStep(desc, this.orderAsc, this.nullsFirst, ctx, this.profilingEnabled);
   }
 
   @Override

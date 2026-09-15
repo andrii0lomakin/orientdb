@@ -12,6 +12,7 @@ import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.YTDBStr
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBGraphCountStrategy;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBGraphMatchStepStrategy;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBGraphStepStrategy;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.InternalExecutionPlan;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.MatchExecutionPlanner;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.MatchPlanInputs;
@@ -218,6 +219,15 @@ public final class GremlinToMatchStrategy
         Traversal.Admin<?, ?> traversal, @Nullable Boolean orderIncludesMissingKey) {
       return GremlinToMatchTranslator.translate(traversal, orderIncludesMissingKey);
     }
+
+    @Nullable @Override
+    public GremlinToMatchTranslator.TranslationResult translate(
+        Traversal.Admin<?, ?> traversal,
+        @Nullable Boolean orderIncludesMissingKey,
+        ResolvedOrderByNullsPlacement orderByNullsPlacements) {
+      return GremlinToMatchTranslator.translate(
+          traversal, orderIncludesMissingKey, orderByNullsPlacements);
+    }
   };
 
   private static final GremlinToMatchStrategy INSTANCE =
@@ -330,13 +340,18 @@ public final class GremlinToMatchStrategy
     if (containsBoundaryStep(traversal)) {
       return;
     }
-    // Resolve the order mode once for this compilation. The shape key below and the
-    // walk further down both read this value. Two independent reads could straddle a runtime flip
+    // Resolve all order settings once for this compilation. The shape key below and the walk
+    // further down both read these values. Two independent reads could straddle a runtime flip
     // and file a plan built under one setting under the other setting's key, in a cache that is
     // storage-wide and outlives the session.
     var orderIncludesMissingKey = YTDBStrategyUtil.orderIncludesMissingKey(traversal);
+    var orderByNullsPlacements = YTDBStrategyUtil.orderByNullsPlacements(traversal);
+    if (orderByNullsPlacements == null) {
+      return;
+    }
     var extraction =
-        GremlinStepWalker.extractShape(traversal, session, orderIncludesMissingKey);
+        GremlinStepWalker.extractShape(
+            traversal, session, orderIncludesMissingKey, orderByNullsPlacements);
     var metrics = GremlinTranslationMetrics.of(session);
     if (populateTranslationCache && extraction.complete()) {
       var cached = GremlinPlanCache.getTranslation(extraction.key(), session);
@@ -355,7 +370,8 @@ public final class GremlinToMatchStrategy
     // inside translate(), so the concurrent-invalidation guard in buildPlan must time from here to
     // catch a DDL that races the walk (see the class Javadoc "Plan caching").
     var planningStart = System.nanoTime();
-    var translation = translator.translate(traversal, orderIncludesMissingKey);
+    var translation =
+        translator.translate(traversal, orderIncludesMissingKey, orderByNullsPlacements);
     if (translation == null) {
       if (populateTranslationCache && extraction.complete()) {
         GremlinPlanCache.putTranslation(
@@ -805,6 +821,14 @@ public final class GremlinToMatchStrategy
     @Nullable default GremlinToMatchTranslator.TranslationResult translate(
         Traversal.Admin<?, ?> traversal, @Nullable Boolean orderIncludesMissingKey) {
       return translate(traversal);
+    }
+
+    /** Translates with all order settings resolved by the caller. */
+    @Nullable default GremlinToMatchTranslator.TranslationResult translate(
+        Traversal.Admin<?, ?> traversal,
+        @Nullable Boolean orderIncludesMissingKey,
+        ResolvedOrderByNullsPlacement orderByNullsPlacements) {
+      return translate(traversal, orderIncludesMissingKey);
     }
   }
 

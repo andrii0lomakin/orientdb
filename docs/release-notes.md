@@ -5,6 +5,42 @@ between your current version and your target version.
 
 ## Unreleased
 
+### ORDER BY null placement is configurable
+
+YouTrackDB now accepts `NULLS FIRST` and `NULLS LAST` on each YouTrackDB Query Language
+(YQL) `ORDER BY` sort item.
+The clause controls one item and comes before its optional `COLLATE` clause.
+
+**Who is affected.** Queries that need a null order other than the shipped direction-specific
+placement can now request it. Existing queries keep their prior results under the shipped values.
+Ascending order ships with nulls first. Descending order ships with nulls last.
+
+**How to configure the server.** Set `youtrackdb.query.orderBy.nullsPlacementAsc` or
+`youtrackdb.query.orderBy.nullsPlacementDesc` to `FIRST` or `LAST`. Set these keys as Java
+system properties at startup:
+
+```
+-Dyoutrackdb.query.orderBy.nullsPlacementAsc=LAST
+-Dyoutrackdb.query.orderBy.nullsPlacementDesc=FIRST
+```
+
+An explicit YQL clause wins over the setting for that sort item. The values take effect when
+YouTrackDB reads the properties at startup.
+
+**How to configure one Gremlin traversal.** Use the public application programming interface
+(API) parameters `YTDBQueryConfigParam.orderByNullsPlacementAsc` and
+`YTDBQueryConfigParam.orderByNullsPlacementDesc`. Both parameters declare `String` values and
+accept `FIRST` or `LAST` without case sensitivity.
+
+```java
+graph.traversal()
+    .with(YTDBQueryConfigParam.orderByNullsPlacementAsc, "LAST")
+    .with(YTDBQueryConfigParam.orderByNullsPlacementDesc, "FIRST");
+```
+
+The per-query parameters override the corresponding server settings and shipped values.
+Caller-supplied comparators retain their own null handling. `Order.shuffle` is unchanged.
+
 ### Gremlin order by keeps a record that lacks the ordered property
 
 A global-scope Gremlin `order()` step used to drop a record that carries no value for the

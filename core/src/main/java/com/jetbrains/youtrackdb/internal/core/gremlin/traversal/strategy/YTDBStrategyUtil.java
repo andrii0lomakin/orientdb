@@ -1,11 +1,14 @@
 package com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy;
 
 import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
+import com.jetbrains.youtrackdb.api.config.OrderByNullsPlacement;
 import com.jetbrains.youtrackdb.api.gremlin.tokens.YTDBQueryConfigParam;
 import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
 import com.jetbrains.youtrackdb.internal.core.gremlin.YTDBGraph;
 import com.jetbrains.youtrackdb.internal.core.gremlin.YTDBTransaction;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.strategy.ContradictoryOrderSemanticsException;
+import com.jetbrains.youtrackdb.internal.core.sql.OrderByNullsUtil;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import javax.annotation.Nullable;
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal.Admin;
 import org.apache.tinkerpop.gremlin.process.traversal.step.util.EmptyStep;
@@ -103,6 +106,47 @@ public final class YTDBStrategyUtil {
     }
     return configuration.getValueAsBoolean(
         GlobalConfiguration.QUERY_GREMLIN_POLYMORPHIC_BY_DEFAULT);
+  }
+
+  /// Resolves both null placements for one traversal. Each explicit per-traversal option overrides
+  /// only its direction. The database setting, server setting, and shipped value then supply every
+  /// direction without an explicit option.
+  @Nullable public static ResolvedOrderByNullsPlacement orderByNullsPlacements(
+      Admin<?, ?> traversal) {
+    final var session = resolveYtdbSession(traversal);
+    if (session == null || session.getConfiguration() == null) {
+      return null;
+    }
+
+    final var configured = OrderByNullsUtil.resolvePlacements(session.getConfiguration());
+    final var ascending =
+        queryNullPlacement(YTDBQueryConfigParam.orderByNullsPlacementAsc, traversal);
+    final var descending =
+        queryNullPlacement(YTDBQueryConfigParam.orderByNullsPlacementDesc, traversal);
+    return new ResolvedOrderByNullsPlacement(
+        ascending == null ? configured.ascending() : ascending,
+        descending == null ? configured.descending() : descending);
+  }
+
+  private static @Nullable OrderByNullsPlacement queryNullPlacement(
+      YTDBQueryConfigParam param, Admin<?, ?> traversal) {
+    final Object raw = getConfigValue(param, traversal);
+    if (raw == null) {
+      return null;
+    }
+    if (raw instanceof OrderByNullsPlacement placement) {
+      return placement;
+    }
+    if (raw instanceof String presentation) {
+      for (var placement : OrderByNullsPlacement.values()) {
+        if (placement.name().equalsIgnoreCase(presentation)) {
+          return placement;
+        }
+      }
+    }
+    throw new IllegalArgumentException(
+        "Invalid value '" + raw + "' for parameter '" + param.name()
+            + "'. Accepted values: FIRST, LAST.");
   }
 
   /// Resolves whether a global-scope `order()` step keeps a record without the ordered property.

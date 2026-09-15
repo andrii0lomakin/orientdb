@@ -2,10 +2,14 @@ package com.jetbrains.youtrackdb.internal.core.sql.executor.cache;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import com.jetbrains.youtrackdb.api.DatabaseType;
+import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
+import com.jetbrains.youtrackdb.api.config.OrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.DbTestBase;
 import com.jetbrains.youtrackdb.internal.core.command.BasicCommandContext;
 import com.jetbrains.youtrackdb.internal.core.command.CommandContext;
@@ -17,6 +21,7 @@ import com.jetbrains.youtrackdb.internal.core.db.record.record.RID;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.PropertyType;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.SchemaClass;
 import com.jetbrains.youtrackdb.internal.core.record.RecordAbstract;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderBy;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLSelectStatement;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLWhereClause;
@@ -570,6 +575,102 @@ public class DeltaBuilderTest {
     assertTrue("Unrelated-class mutation contributes no skip", cursor.getSkipSet().isEmpty());
     assertEquals("Unrelated-class mutation contributes no inject", 0, cursor.injectSize());
     assertFalse(cursor.hasNextInject());
+    db.rollback();
+  }
+
+  /**
+   * Null placement belongs to the entry, so the sorted inject list and the later view merge cannot
+   * disagree. The first build reads LAST from the storage setting and sorts the null key
+   * last. Changing the storage setting and rebuilding at a fresher mutation version must keep the
+   * first placement. The frozen cached rows were produced under it. A second reading would sort the
+   * null key first here, and the merge would then rank rows the other way.
+   */
+  @Test
+  public void nullPlacementIsFixedOncePerEntry() {
+    var storageConfig = db.getStorage().getContextConfiguration();
+    storageConfig.setValue(
+        GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC, OrderByNullsPlacement.LAST);
+    try {
+      db.begin();
+      var orderBy = parseOrderBy("SELECT FROM " + CLASS_NAME + " ORDER BY " + FIELD + " ASC");
+      var entry = recordEntry(null, orderBy, List.of());
+
+      newRec(10);
+      db.newEntity(CLASS_NAME); // no sort key, so it compares as null
+      var first = DeltaBuilder.buildForRecord(entry, tx(), ctx(null));
+
+      assertEquals(2, first.injectSize());
+      assertEquals(Integer.valueOf(10), first.getInjectList().get(0).getProperty(FIELD));
+      assertNull("LAST puts the null key last",
+          first.getInjectList().get(1).getProperty(FIELD));
+
+      storageConfig.setValue(
+          GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC, OrderByNullsPlacement.FIRST);
+      newRec(20); // advances the mutation version, which forces a rebuild
+      var second = DeltaBuilder.buildForRecord(entry, tx(), ctx(null));
+
+      assertEquals(new ResolvedOrderByNullsPlacement(
+          OrderByNullsPlacement.LAST, OrderByNullsPlacement.LAST), entry.fixedNullsDefault());
+      assertEquals(3, second.injectSize());
+      assertNull("the entry keeps its placement across rebuilds",
+          second.getInjectList().get(2).getProperty(FIELD));
+      db.rollback();
+    } finally {
+      storageConfig.setValue(GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC, null);
+    }
+  }
+
+  /**
+   * A seed installed at populate governs every later comparison. The delta build must not read the
+   * configuration again, so a change landing between populate and the first build cannot drift the
+   * order. Here the seed says nulls last, the storage setting says nulls first, and the sorted
+   * inject list has to follow the seed.
+   */
+  @Test
+  public void seededPlacementSurvivesALaterConfigurationChange() {
+    var storageConfig = db.getStorage().getContextConfiguration();
+    storageConfig.setValue(
+        GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC, OrderByNullsPlacement.FIRST);
+    try {
+      db.begin();
+      var orderBy = parseOrderBy("SELECT FROM " + CLASS_NAME + " ORDER BY " + FIELD + " ASC");
+      var entry = recordEntry(null, orderBy, List.of());
+      entry.seedNullsDefault(ResolvedOrderByNullsPlacement.REVERSED);
+
+      newRec(10);
+      db.newEntity(CLASS_NAME); // no sort key, so it compares as null
+      var cursor = DeltaBuilder.buildForRecord(entry, tx(), ctx(null));
+
+      assertEquals(2, cursor.injectSize());
+      assertEquals(Integer.valueOf(10), cursor.getInjectList().get(0).getProperty(FIELD));
+      assertNull("the seed decides, not the current setting",
+          cursor.getInjectList().get(1).getProperty(FIELD));
+      db.rollback();
+    } finally {
+      storageConfig.setValue(GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC, null);
+    }
+  }
+
+  /**
+   * Seeding twice is a construction bug, because two comparisons of one entry must rank rows alike.
+   * The assertion fails it here, where tests run with assertions enabled. Production keeps the first
+   * placement instead of throwing. A throw would roll back a user transaction, and earlier
+   * comparisons on this entry already used that first value.
+   */
+  @Test
+  public void secondSeedIsRejectedAndTheFirstPlacementSurvives() {
+    db.begin();
+    var orderBy = parseOrderBy("SELECT FROM " + CLASS_NAME + " ORDER BY " + FIELD + " ASC");
+    var entry = recordEntry(null, orderBy, List.of());
+    entry.seedNullsDefault(ResolvedOrderByNullsPlacement.REVERSED);
+
+    assertThrows(
+        AssertionError.class,
+        () -> entry.seedNullsDefault(ResolvedOrderByNullsPlacement.SHIPPED));
+    assertEquals(
+        "the first placement must survive a rejected second seed",
+        ResolvedOrderByNullsPlacement.REVERSED,
+        entry.fixedNullsDefault());
     db.rollback();
   }
 }

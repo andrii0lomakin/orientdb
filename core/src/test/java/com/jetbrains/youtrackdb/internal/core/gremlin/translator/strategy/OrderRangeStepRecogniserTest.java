@@ -13,9 +13,11 @@ import com.jetbrains.youtrackdb.internal.core.gremlin.translator.strategy.Transl
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.strategy.TranslatorEquivalenceSupport.Recognition;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.lambda.RecordIdSortKeyTraversal;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.optimization.YTDBOrderRidTieBreakStrategy;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.MatchPlanInputs;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.builder.ByModulatorTranslator;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.Pattern;
+import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderByItem;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -91,6 +93,27 @@ public class OrderRangeStepRecogniserTest extends GraphBaseTest {
 
     assertThat(outcome).isEqualTo(Outcome.ACCEPTED);
     assertThat(ctx.orderBy.getItems()).hasSize(3);
+  }
+
+  /** Every converted item carries explicit placement, including the trailing RID tie-break. */
+  @Test
+  public void orderByMultiKey_writesExplicitPlacementOnEveryItem() {
+    var admin =
+        graph.traversal().V().order().by("age", Order.asc).by("name", Order.desc).asAdmin();
+    var ctx = seededContext();
+    ctx.setOrderByNullsPlacements(ResolvedOrderByNullsPlacement.REVERSED);
+
+    assertThat(recognizeOrder(admin, ctx)).isEqualTo(Outcome.ACCEPTED);
+
+    assertThat(ctx.orderBy.getItems())
+        .extracting(SQLOrderByItem::getNullOrdering)
+        .containsExactly(
+            SQLOrderByItem.NULLS_LAST,
+            SQLOrderByItem.NULLS_FIRST,
+            SQLOrderByItem.NULLS_FIRST);
+    var ridItemText = new StringBuilder();
+    ctx.orderBy.getItems().getLast().toString(Map.of(), ridItemText);
+    assertThat(ridItemText).asString().containsIgnoringCase("@rid");
   }
 
   /**

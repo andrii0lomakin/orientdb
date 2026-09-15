@@ -6,6 +6,7 @@ import com.jetbrains.youtrackdb.internal.core.command.CommandContext;
 import com.jetbrains.youtrackdb.internal.core.db.AbstractMetadataUpdateCache;
 import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
 import com.jetbrains.youtrackdb.internal.core.query.ExecutionPlan;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.InternalExecutionPlan;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -13,11 +14,32 @@ import javax.annotation.Nullable;
 /**
  * LRU cache for already prepared YQL/SQL execution plans using Guava Cache. Stores itself in
  * SharedContext as a resource and acts as an entry point for the SQL executor.
+ *
+ * <p><b>Null placement stamp.</b> A plan build can bake the position of null sort keys into a step,
+ * so a plan prepared under one placement must never be served under another. Each stored plan
+ * therefore carries the placement pair its own build resolved, and a lookup compares that stamp
+ * against the pair the looking-up session resolves. A mismatch drops that one plan and reports a
+ * miss, which leaves every other prepared plan in place. A build that resolved no placement stores
+ * no stamp. A lookup of such a plan skips placement configuration resolution. Every lookup still
+ * reads the command timeout configuration.
  */
-public class YqlExecutionPlanCache extends AbstractMetadataUpdateCache<String, InternalExecutionPlan> {
+public class YqlExecutionPlanCache
+    extends AbstractMetadataUpdateCache<String, YqlExecutionPlanCache.StampedPlan> {
 
   private volatile long lastGlobalTimeout =
       GlobalConfiguration.COMMAND_TIMEOUT.getValueAsLong();
+
+  /**
+   * A prepared plan together with the null placement pair its build resolved.
+   *
+   * <p>{@code placements} is {@code null} when the build resolved none, which marks the plan as one
+   * no placement change can invalidate.
+   */
+  record StampedPlan(
+      @Nonnull InternalExecutionPlan plan,
+      @Nullable ResolvedOrderByNullsPlacement placements) {
+
+  }
 
   /**
    * @param size the size of the cache; 0 means cache disabled
@@ -61,8 +83,18 @@ public class YqlExecutionPlanCache extends AbstractMetadataUpdateCache<String, I
     return resource.getInternal(statement, ctx, db);
   }
 
+  /**
+   * Publishes a freshly built plan.
+   *
+   * @param placements the null placement pair the enclosing scope resolved, or {@code null} when
+   *                   the scope resolved none. Read it inside the scope so lookup can validate any
+   *                   placement-sensitive work covered by that scope.
+   */
   public static void put(
-      String statement, ExecutionPlan plan, DatabaseSessionEmbedded db) {
+      String statement,
+      ExecutionPlan plan,
+      DatabaseSessionEmbedded db,
+      @Nullable ResolvedOrderByNullsPlacement placements) {
     if (db == null) {
       throw new IllegalArgumentException("DB cannot be null");
     }
@@ -71,10 +103,14 @@ public class YqlExecutionPlanCache extends AbstractMetadataUpdateCache<String, I
     }
 
     var resource = db.getSharedContext().getYqlExecutionPlanCache();
-    resource.putInternal(statement, plan, db);
+    resource.putInternal(statement, plan, db, placements);
   }
 
-  public void putInternal(String statement, ExecutionPlan plan, DatabaseSessionEmbedded db) {
+  public void putInternal(
+      String statement,
+      ExecutionPlan plan,
+      DatabaseSessionEmbedded db,
+      @Nullable ResolvedOrderByNullsPlacement placements) {
     if (statement == null || !cacheEnabled()) {
       return;
     }
@@ -92,7 +128,7 @@ public class YqlExecutionPlanCache extends AbstractMetadataUpdateCache<String, I
     internal = internal.copy(ctx);
     // this copy is never used, so it has to be closed to free resources
     internal.close();
-    putCached(statement, internal);
+    putCached(statement, new StampedPlan(internal, placements));
   }
 
   /**
@@ -109,6 +145,8 @@ public class YqlExecutionPlanCache extends AbstractMetadataUpdateCache<String, I
     var currentGlobalTimeout =
         db.getConfiguration().getValueAsLong(GlobalConfiguration.COMMAND_TIMEOUT);
     if (currentGlobalTimeout != this.lastGlobalTimeout) {
+      // The timeout shapes every prepared plan, so a change drops the whole cache. Checked before
+      // Guava is touched, so no plan prepared under the previous timeout can become a hit.
       invalidate();
       this.lastGlobalTimeout = currentGlobalTimeout;
     }
@@ -129,8 +167,18 @@ public class YqlExecutionPlanCache extends AbstractMetadataUpdateCache<String, I
     // Guava Cache handles LRU eviction and concurrent access internally
     var result = getCached(statement);
     if (result != null) {
+      var stamp = result.placements();
+      if (stamp != null && !stamp.equals(db.getPlanNullPlacements().resolve())) {
+        // This plan was prepared under another null placement, so its baked-in order no longer
+        // matches what the statement must return. Drop this one plan and report a miss so the
+        // caller prepares it again. A plan with no stamp skips this branch and its configuration
+        // read entirely.
+        invalidateCached(statement);
+        recordMiss();
+        return null;
+      }
       recordHit();
-      return result.copy(ctx);
+      return result.plan().copy(ctx);
     }
     recordMiss();
     return null;

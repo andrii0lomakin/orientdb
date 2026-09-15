@@ -4,6 +4,7 @@ import static com.jetbrains.youtrackdb.internal.core.sql.executor.ExecutionPlanP
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
+import com.jetbrains.youtrackdb.api.config.OrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.DbTestBase;
 import com.jetbrains.youtrackdb.internal.SequentialTest;
 import com.jetbrains.youtrackdb.internal.common.concur.TimeoutException;
@@ -7079,6 +7080,222 @@ public class SelectStatementExecutionTest extends DbTestBase {
     Assert.assertEquals(Arrays.asList("c", "b", "a", null, null), ordered);
   }
 
+  /**
+   * Explicit {@code NULLS FIRST} with ASC: absolute placement puts nulls first. Index-accelerated
+   * path must still satisfy ORDER BY from the index (no OrderByStep).
+   */
+  @Test
+  public void testOrderByAscNullsFirstIndexAccelerated() {
+    var className = "testOrderByAscNullsFirstIdx";
+    createIndexedNameClass(className, INDEX_TYPE.NOTUNIQUE);
+    seedNames(className, Arrays.asList("b", "a", "c", null, null));
+
+    var ordered = orderedNamesIndexAccelerated(className, "ASC NULLS FIRST");
+
+    Assert.assertEquals(Arrays.asList(null, null, "a", "b", "c"), ordered);
+  }
+
+  /**
+   * Explicit {@code NULLS LAST} with ASC: absolute placement puts nulls last even though ASC with
+   * the default FIRST would put them first. Index path must match.
+   */
+  @Test
+  public void testOrderByAscNullsLastIndexAccelerated() {
+    var className = "testOrderByAscNullsLastIdx";
+    createIndexedNameClass(className, INDEX_TYPE.NOTUNIQUE);
+    seedNames(className, Arrays.asList("b", "a", "c", null, null));
+
+    var ordered = orderedNamesIndexAccelerated(className, "ASC NULLS LAST");
+
+    Assert.assertEquals(Arrays.asList("a", "b", "c", null, null), ordered);
+  }
+
+  /**
+   * Explicit {@code NULLS FIRST} with DESC puts nulls first instead of the shipped LAST placement.
+   */
+  @Test
+  public void testOrderByDescNullsFirstIndexAccelerated() {
+    var className = "testOrderByDescNullsFirstIdx";
+    createIndexedNameClass(className, INDEX_TYPE.NOTUNIQUE);
+    seedNames(className, Arrays.asList("b", "a", "c", null, null));
+
+    var ordered = orderedNamesIndexAccelerated(className, "DESC NULLS FIRST");
+
+    Assert.assertEquals(Arrays.asList(null, null, "c", "b", "a"), ordered);
+  }
+
+  /**
+   * Explicit {@code NULLS LAST} with DESC pins the same placement as the shipped LAST setting.
+   */
+  @Test
+  public void testOrderByDescNullsLastIndexAccelerated() {
+    var className = "testOrderByDescNullsLastIdx";
+    createIndexedNameClass(className, INDEX_TYPE.NOTUNIQUE);
+    seedNames(className, Arrays.asList("b", "a", "c", null, null));
+
+    var ordered = orderedNamesIndexAccelerated(className, "DESC NULLS LAST");
+
+    Assert.assertEquals(Arrays.asList("c", "b", "a", null, null), ordered);
+  }
+
+  /**
+   * In-memory ASC {@code NULLS LAST}: reference for the index-accelerated ASC NULLS LAST path.
+   */
+  @Test
+  public void testOrderByAscNullsLastInMemory() {
+    var className = "testOrderByAscNullsLastNoIdx";
+    createPlainNameClass(className);
+    seedNames(className, Arrays.asList("b", "a", "c", null, null));
+
+    var ordered = orderedNamesInMemory(className, "ASC NULLS LAST");
+
+    Assert.assertEquals(Arrays.asList("a", "b", "c", null, null), ordered);
+  }
+
+  /**
+   * In-memory DESC {@code NULLS FIRST}: reference for the index-accelerated DESC NULLS FIRST path.
+   */
+  @Test
+  public void testOrderByDescNullsFirstInMemory() {
+    var className = "testOrderByDescNullsFirstNoIdx";
+    createPlainNameClass(className);
+    seedNames(className, Arrays.asList("b", "a", "c", null, null));
+
+    var ordered = orderedNamesInMemory(className, "DESC NULLS FIRST");
+
+    Assert.assertEquals(Arrays.asList(null, null, "c", "b", "a"), ordered);
+  }
+
+  /**
+   * Omitted NULLS clause with ascending placement {@code LAST} puts nulls last. Both
+   * index-accelerated and in-memory paths must agree.
+   */
+  @Test
+  public void testOrderByGlobalLastPlacementAscending() {
+    var previous = GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.getValue();
+    GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.setValue(OrderByNullsPlacement.LAST);
+    try {
+      var indexed = "testOrderByLastPlacementAscIdx";
+      createIndexedNameClass(indexed, INDEX_TYPE.NOTUNIQUE);
+      seedNames(indexed, Arrays.asList("b", "a", "c", null, null));
+      Assert.assertEquals(
+          Arrays.asList("a", "b", "c", null, null), orderedNamesIndexAccelerated(indexed, "ASC"));
+
+      var plain = "testOrderByLastPlacementAscNoIdx";
+      createPlainNameClass(plain);
+      seedNames(plain, Arrays.asList("b", "a", "c", null, null));
+      Assert.assertEquals(
+          Arrays.asList("a", "b", "c", null, null), orderedNamesInMemory(plain, "ASC"));
+    } finally {
+      GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.setValue(previous);
+    }
+  }
+
+  /**
+   * Omitted NULLS clause with descending placement {@code FIRST} puts nulls first. Both paths must
+   * agree.
+   */
+  @Test
+  public void testOrderByGlobalFirstPlacementDescending() {
+    var previous = GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_DESC.getValue();
+    GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_DESC.setValue(OrderByNullsPlacement.FIRST);
+    try {
+      var indexed = "testOrderByFirstPlacementDescIdx";
+      createIndexedNameClass(indexed, INDEX_TYPE.NOTUNIQUE);
+      seedNames(indexed, Arrays.asList("b", "a", "c", null, null));
+      Assert.assertEquals(
+          Arrays.asList(null, null, "c", "b", "a"), orderedNamesIndexAccelerated(indexed, "DESC"));
+
+      var plain = "testOrderByFirstPlacementDescNoIdx";
+      createPlainNameClass(plain);
+      seedNames(plain, Arrays.asList("b", "a", "c", null, null));
+      Assert.assertEquals(
+          Arrays.asList(null, null, "c", "b", "a"), orderedNamesInMemory(plain, "DESC"));
+    } finally {
+      GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_DESC.setValue(previous);
+    }
+  }
+
+  /**
+   * Explicit {@code NULLS FIRST} overrides a {@code LAST} global default: ASC still puts
+   * nulls first. Pins the precedence rule (clause &gt; global default).
+   */
+  @Test
+  public void testOrderByExplicitNullsOverridesGlobalPlacement() {
+    var previous = GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.getValue();
+    GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.setValue(OrderByNullsPlacement.LAST);
+    try {
+      var className = "testOrderByNullsOverride";
+      createPlainNameClass(className);
+      seedNames(className, Arrays.asList("b", "a", null));
+
+      var ordered = orderedNamesInMemory(className, "ASC NULLS FIRST");
+
+      Assert.assertEquals(Arrays.asList(null, "a", "b"), ordered);
+    } finally {
+      GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.setValue(previous);
+    }
+  }
+
+  /**
+   * A per-storage ascending placement overrides the runtime global when the
+   * NULLS clause is omitted.
+   */
+  @Test
+  public void testOrderByStorageLocalPlacementOverridesGlobal() {
+    var previous = GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.getValue();
+    GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.setValue(OrderByNullsPlacement.FIRST);
+    session
+        .getStorage()
+        .getContextConfiguration()
+        .setValue(GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC,
+            OrderByNullsPlacement.LAST);
+    try {
+      var className = "testOrderByStorageLastPlacement";
+      createPlainNameClass(className);
+      seedNames(className, Arrays.asList("b", "a", "c", null, null));
+
+      var ordered = orderedNamesInMemory(className, "ASC");
+
+      Assert.assertEquals(Arrays.asList("a", "b", "c", null, null), ordered);
+    } finally {
+      GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC.setValue(previous);
+      session
+          .getStorage()
+          .getContextConfiguration()
+          .setValue(GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC, null);
+    }
+  }
+
+  /**
+   * COLLATE + {@code NULLS LAST}: null placement comes from the NULLS clause (absolute), while
+   * non-null string ordering uses the collate. Forces in-memory sort because COLLATE disables the
+   * index-for-sort optimization.
+   */
+  @Test
+  public void testOrderByCollateWithNullsLast() {
+    var className = "testOrderByCollateNullsLast";
+    createPlainNameClass(className);
+    seedNames(className, Arrays.asList("b", "A", "c", null));
+
+    session.begin();
+    try (var result =
+        session.query(
+            "SELECT name FROM " + className + " ORDER BY name ASC NULLS LAST COLLATE ci")) {
+      var plan = result.getExecutionPlan().prettyPrint(0, 2);
+      Assert.assertTrue("COLLATE must force in-memory OrderByStep, plan was:\n" + plan,
+          plan.contains("ORDER BY"));
+      var names = new ArrayList<>();
+      while (result.hasNext()) {
+        names.add(result.next().<Object>getProperty("name"));
+      }
+      // ci orders A/b/c case-insensitively; nulls last from the explicit clause.
+      Assert.assertEquals(Arrays.asList("A", "b", "c", null), names);
+    } finally {
+      session.commit();
+    }
+  }
+
   /** Creates a class with a STRING {@code name} property and an index of {@code type} on it. */
   private void createIndexedNameClass(String className, INDEX_TYPE type) {
     var cls = session.getMetadata().getSchema().createClass(className);
@@ -7112,13 +7329,15 @@ public class SelectStatementExecutionTest extends DbTestBase {
   }
 
   /**
-   * Runs {@code SELECT name FROM <className> ORDER BY name <direction>}, asserts the planner
+   * Runs {@code SELECT name FROM <className> ORDER BY name <orderBySuffix>}, asserts the planner
    * satisfied the sort from the index — the plan contains a {@link FetchFromIndexStep} and adds no
    * in-memory {@link OrderByStep} — and returns the emitted {@code name} values in result order
    * (nulls included). Use this for a class that has an index on {@code name}.
+   * {@code orderBySuffix} is the text after the field name (e.g. {@code ASC},
+   * {@code DESC NULLS FIRST}).
    */
-  private List<Object> orderedNamesIndexAccelerated(String className, String direction) {
-    var run = runOrderByQuery(className, direction);
+  private List<Object> orderedNamesIndexAccelerated(String className, String orderBySuffix) {
+    var run = runOrderByQuery(className, orderBySuffix);
     Assert.assertTrue(
         "expected an index-accelerated sort (FetchFromIndexStep), plan was:\n" + run.renderedPlan(),
         run.fetchFromIndexSteps() >= 1);
@@ -7130,14 +7349,15 @@ public class SelectStatementExecutionTest extends DbTestBase {
   }
 
   /**
-   * Runs {@code SELECT name FROM <className> ORDER BY name <direction>}, asserts the sort ran in
+   * Runs {@code SELECT name FROM <className> ORDER BY name <orderBySuffix>}, asserts the sort ran in
    * memory — the plan contains an {@link OrderByStep} and no {@link FetchFromIndexStep} — and
    * returns the emitted {@code name} values in result order (nulls included). Use this for a class
    * with no index on {@code name}, so its result is the reference the index-accelerated path must
-   * match.
+   * match. {@code orderBySuffix} is the text after the field name (e.g. {@code ASC},
+   * {@code DESC NULLS FIRST}).
    */
-  private List<Object> orderedNamesInMemory(String className, String direction) {
-    var run = runOrderByQuery(className, direction);
+  private List<Object> orderedNamesInMemory(String className, String orderBySuffix) {
+    var run = runOrderByQuery(className, orderBySuffix);
     Assert.assertEquals(
         "expected an in-memory sort (no index), plan was:\n" + run.renderedPlan(), 0,
         run.fetchFromIndexSteps());
@@ -7148,17 +7368,17 @@ public class SelectStatementExecutionTest extends DbTestBase {
   }
 
   /**
-   * Runs {@code SELECT name FROM <className> ORDER BY name <direction>} and returns the plan-step
-   * counts, the rendered plan (for assertion messages), and the emitted {@code name} values in
-   * result order (nulls included). The {@code ResultSet} is closed and the transaction committed
-   * unconditionally, so a failed assertion in a caller cannot leak either. The wrappers {@link
-   * #orderedNamesIndexAccelerated} / {@link #orderedNamesInMemory} add the plan-shape assertion
-   * that tells an index-accelerated sort apart from an in-memory one.
+   * Runs {@code SELECT name FROM <className> ORDER BY name <orderBySuffix>} and returns the
+   * plan-step counts, the rendered plan (for assertion messages), and the emitted {@code name}
+   * values in result order (nulls included). The {@code ResultSet} is closed and the transaction
+   * committed unconditionally, so a failed assertion in a caller cannot leak either. The wrappers
+   * {@link #orderedNamesIndexAccelerated} / {@link #orderedNamesInMemory} add the plan-shape
+   * assertion that tells an index-accelerated sort apart from an in-memory one.
    */
-  private OrderByRun runOrderByQuery(String className, String direction) {
+  private OrderByRun runOrderByQuery(String className, String orderBySuffix) {
     session.begin();
     try (var result =
-        session.query("SELECT name FROM " + className + " ORDER BY name " + direction)) {
+        session.query("SELECT name FROM " + className + " ORDER BY name " + orderBySuffix)) {
       var plan = result.getExecutionPlan();
       var fetchFromIndex =
           plan.getSteps().stream().filter(step -> step instanceof FetchFromIndexStep).count();

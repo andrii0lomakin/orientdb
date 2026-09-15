@@ -1,10 +1,16 @@
 package com.jetbrains.youtrackdb.internal.core.sql.parser;
 
 import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
+import com.jetbrains.youtrackdb.api.config.OrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.SequentialTest;
 import com.jetbrains.youtrackdb.internal.BaseMemoryInternalDatabase;
+import com.jetbrains.youtrackdb.internal.core.command.BasicCommandContext;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.PropertyType;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.SchemaClass;
+import com.jetbrains.youtrackdb.internal.core.sql.OrderByNullsUtil;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
+import com.jetbrains.youtrackdb.internal.core.sql.SQLEngine;
+import com.jetbrains.youtrackdb.internal.core.sql.executor.InternalExecutionPlan;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Assert;
@@ -49,6 +55,106 @@ public class YqlExecutionPlanCacheTest extends BaseMemoryInternalDatabase {
 
     prop.createIndex(SchemaClass.INDEX_TYPE.NOTUNIQUE);
     Assert.assertFalse(cache.contains(stm));
+  }
+
+  /**
+   * A placement change rejects one stamped plan without invalidating an unstamped neighbour. Both
+   * direction-specific settings must drive the same per-entry gate and cache accounting.
+   */
+  @Test
+  public void nullPlacementChangesRejectStampedPlansInBothDirections() {
+    assertPlacementChangeRejectsPlan(
+        "Asc", "ASC", GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC);
+    assertPlacementChangeRejectsPlan(
+        "Desc", "DESC", GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_DESC);
+  }
+
+  private void assertPlacementChangeRejectsPlan(
+      String suffix, String direction, GlobalConfiguration placementKey) {
+    var className = "PlanCacheNullPlacement" + suffix;
+    var clazz = session.getMetadata().getSchema().createClass(className);
+    clazz.createProperty("rank", PropertyType.INTEGER);
+
+    var orderedSql = "SELECT rank FROM " + className + " ORDER BY rank " + direction;
+    var unorderedSql = "SELECT rank FROM " + className;
+    var ctx = new BasicCommandContext();
+    ctx.setDatabaseSession(session);
+    var ordered = (SQLSelectStatement) SQLEngine.parse(orderedSql, session);
+    var unordered = (SQLSelectStatement) SQLEngine.parse(unorderedSql, session);
+    var orderedPlan = ordered.createExecutionPlan(ctx, false);
+    var unorderedPlan = unordered.createExecutionPlan(ctx, false);
+    var storageConfig = session.getStorage().getContextConfiguration();
+    var oldPlacement = storageConfig.getValue(placementKey);
+
+    try {
+      storageConfig.setValue(placementKey, OrderByNullsPlacement.FIRST);
+      var stamp = OrderByNullsUtil.resolvePlacements(session.getConfiguration());
+      var cache = new YqlExecutionPlanCache(16);
+      cache.putInternal(orderedSql, orderedPlan, session, stamp);
+      cache.putInternal(unorderedSql, unorderedPlan, session, null);
+      var invalidationBefore = cache.getLastInvalidation();
+
+      storageConfig.setValue(placementKey, OrderByNullsPlacement.LAST);
+      Assert.assertNull("the stale stamped plan must be rejected",
+          cache.getInternal(orderedSql, ctx, session));
+      Assert.assertFalse("the stale stamped plan must be removed", cache.contains(orderedSql));
+      Assert.assertEquals("the rejection must count as one miss", 1, cache.getMisses());
+      Assert.assertEquals("the rejection must not count as a hit", 0, cache.getHits());
+      Assert.assertEquals("one rejection must not invalidate the whole cache",
+          invalidationBefore, cache.getLastInvalidation());
+
+      var served = cache.getInternal(unorderedSql, ctx, session);
+      Assert.assertNotNull("the unstamped neighbouring plan must be served", served);
+      ((InternalExecutionPlan) served).close();
+      Assert.assertEquals("the unstamped lookup must count as one hit", 1, cache.getHits());
+      Assert.assertTrue("the unstamped neighbouring plan must remain", cache.contains(unorderedSql));
+    } finally {
+      storageConfig.setValue(placementKey, oldPlacement);
+      orderedPlan.close();
+      unorderedPlan.close();
+    }
+  }
+
+  /**
+   * A stored plan is validated against its own placement stamp, one entry at a time.
+   *
+   * <p>The test stamps a plan with a placement pair the session does not currently resolve, which is
+   * the state a build leaves behind when the setting changes while that build runs. The lookup must
+   * refuse that plan and drop it. The same plan stored without a stamp must be served, because no
+   * sort clause of it depends on placement.
+   */
+  @Test
+  public void stampedPlanIsRejectedWhileUnstampedPlanIsServed() {
+    var sql = "SELECT FROM OUser";
+    var ctx = new BasicCommandContext();
+    ctx.setDatabaseSession(session);
+    var statement = (SQLSelectStatement) SQLEngine.parse(sql, session);
+    var plan = statement.createExecutionPlan(ctx, false);
+    try {
+      var cache = new YqlExecutionPlanCache(16);
+      var current = OrderByNullsUtil.resolvePlacements(session.getConfiguration());
+      var other =
+          new ResolvedOrderByNullsPlacement(
+              current.ascending() == OrderByNullsPlacement.FIRST
+                  ? OrderByNullsPlacement.LAST
+                  : OrderByNullsPlacement.FIRST,
+              current.descending());
+
+      cache.putInternal(sql, plan, session, other);
+      Assert.assertTrue("the stamped plan must be stored", cache.contains(sql));
+      Assert.assertNull(
+          "a plan stamped with another placement must not be served",
+          cache.getInternal(sql, ctx, session));
+      Assert.assertFalse("the rejected plan must be dropped", cache.contains(sql));
+
+      cache.putInternal(sql, plan, session, null);
+      var served = cache.getInternal(sql, ctx, session);
+      Assert.assertNotNull("a plan with no stamp must be served", served);
+      ((InternalExecutionPlan) served).close();
+      Assert.assertTrue("a plan with no stamp must stay stored", cache.contains(sql));
+    } finally {
+      plan.close();
+    }
   }
 
   @Test

@@ -4,6 +4,7 @@ import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.ListShapingOp;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.strategy.YTDBStrategyUtil;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.Schema;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.MatchPlanInputs;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.builder.MatchWhereBuilder;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.Pattern;
@@ -13,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import org.apache.tinkerpop.gremlin.process.traversal.Step;
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
@@ -387,7 +389,10 @@ final class GremlinStepWalker {
   static GremlinShapeExtractor.Extraction extractShape(
       Traversal.Admin<?, ?> traversal, DatabaseSessionEmbedded session) {
     return extractShape(
-        traversal, session, YTDBStrategyUtil.orderIncludesMissingKey(traversal));
+        traversal,
+        session,
+        YTDBStrategyUtil.orderIncludesMissingKey(traversal),
+        YTDBStrategyUtil.orderByNullsPlacements(traversal));
   }
 
   /**
@@ -399,8 +404,25 @@ final class GremlinStepWalker {
       Traversal.Admin<?, ?> traversal,
       DatabaseSessionEmbedded session,
       @Nullable Boolean orderIncludesMissingKey) {
+    return extractShape(
+        traversal,
+        session,
+        orderIncludesMissingKey,
+        YTDBStrategyUtil.orderByNullsPlacements(traversal));
+  }
+
+  static GremlinShapeExtractor.Extraction extractShape(
+      Traversal.Admin<?, ?> traversal,
+      DatabaseSessionEmbedded session,
+      @Nullable Boolean orderIncludesMissingKey,
+      ResolvedOrderByNullsPlacement orderByNullsPlacements) {
     return GremlinShapeExtractor.extract(
-        PRODUCTION_RECOGNISERS, TRANSPARENT_STEPS, traversal, session, orderIncludesMissingKey);
+        PRODUCTION_RECOGNISERS,
+        TRANSPARENT_STEPS,
+        traversal,
+        session,
+        orderIncludesMissingKey,
+        orderByNullsPlacements);
   }
 
   /**
@@ -409,7 +431,7 @@ final class GremlinStepWalker {
    * null}.
    */
   @Nullable GremlinToMatchTranslator.TranslationResult walk(Traversal.Admin<?, ?> traversal) {
-    return walk(traversal, NO_CHILD_SCOPE, null);
+    return walk(traversal, NO_CHILD_SCOPE, null, null);
   }
 
   /**
@@ -418,7 +440,14 @@ final class GremlinStepWalker {
    */
   @Nullable GremlinToMatchTranslator.TranslationResult walk(
       Traversal.Admin<?, ?> traversal, @Nullable Boolean orderIncludesMissingKey) {
-    return walk(traversal, NO_CHILD_SCOPE, orderIncludesMissingKey);
+    return walk(traversal, NO_CHILD_SCOPE, orderIncludesMissingKey, null);
+  }
+
+  @Nullable GremlinToMatchTranslator.TranslationResult walk(
+      Traversal.Admin<?, ?> traversal,
+      @Nullable Boolean orderIncludesMissingKey,
+      @Nonnull ResolvedOrderByNullsPlacement orderByNullsPlacements) {
+    return walk(traversal, NO_CHILD_SCOPE, orderIncludesMissingKey, orderByNullsPlacements);
   }
 
   /**
@@ -437,17 +466,18 @@ final class GremlinStepWalker {
    */
   @Nullable GremlinToMatchTranslator.TranslationResult walk(
       Traversal.Admin<?, ?> traversal, int childScopeBoundary) {
-    return walk(traversal, childScopeBoundary, null);
+    return walk(traversal, childScopeBoundary, null, null);
   }
 
   /**
-   * The full walk entry point receives the resolved order mode.
-   * A {@code null} value asks this method to resolve the mode.
+   * The full walk entry point receives resolved order settings. Null values ask this method to
+   * resolve the corresponding settings.
    */
   @Nullable GremlinToMatchTranslator.TranslationResult walk(
       Traversal.Admin<?, ?> traversal,
       int childScopeBoundary,
-      @Nullable Boolean orderIncludesMissingKey) {
+      @Nullable Boolean orderIncludesMissingKey,
+      @Nullable ResolvedOrderByNullsPlacement orderByNullsPlacements) {
     // Empty-traversal gate, before any per-step work. A step-less traversal has nothing to translate
     // and could never pin a boundary, so decline it here rather than let it fall through to the
     // terminator invariant below — an empty traversal is a normal shape, not a recogniser bug.
@@ -496,17 +526,26 @@ final class GremlinStepWalker {
             .getStrategy(ProductiveByStrategy.class)
             .map(ProductiveByStrategy::getProductiveKeys)
             .orElse(null));
-    // Resolve the order mode through the resolver used by native execution.
-    // The resolver combines the option, user strategy, and database setting.
+    // Resolve order behavior through the same entry points used by native execution.
     ctx.setOrderIncludesMissingKey(
         Boolean.TRUE.equals(
             orderIncludesMissingKey != null
                 ? orderIncludesMissingKey
                 : YTDBStrategyUtil.orderIncludesMissingKey(traversal)));
+    var resolvedNullsPlacements =
+        orderByNullsPlacements != null
+            ? orderByNullsPlacements
+            : YTDBStrategyUtil.orderByNullsPlacements(traversal);
+    if (resolvedNullsPlacements == null) {
+      return null;
+    }
+    ctx.setOrderByNullsPlacements(resolvedNullsPlacements);
     var cursor = new StepStreamCursor(steps, TRANSPARENT_STEPS);
     // Install the union fork host after the cursor exists: the host reads prefix length from the
     // cursor position after UnionStepRecogniser.take(), and keeps the parent Admin private.
-    ctx.setUnionForkHost(new UnionForkHostImpl(traversal, cursor, ctx, recognisers));
+    ctx.setUnionForkHost(
+        new UnionForkHostImpl(
+            traversal, cursor, ctx, recognisers, resolvedNullsPlacements));
 
     // Cursor-driven dispatch. A missing recogniser or a DECLINE declines the whole traversal
     // (all-or-nothing), returning false; the shared driver is reused by the sub-walk below.

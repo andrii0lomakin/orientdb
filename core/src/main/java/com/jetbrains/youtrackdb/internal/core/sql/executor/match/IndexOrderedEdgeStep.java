@@ -11,6 +11,7 @@ import com.jetbrains.youtrackdb.internal.core.index.engine.EquiDepthHistogram;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.SchemaClass;
 import com.jetbrains.youtrackdb.internal.core.query.Result;
 import com.jetbrains.youtrackdb.internal.core.record.impl.EntityImpl;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.AbstractExecutionStep;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.ExecutionStepInternal;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.IndexSearchDescriptor;
@@ -18,6 +19,7 @@ import com.jetbrains.youtrackdb.internal.core.sql.executor.ResultInternal;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.RidFilteredIndexValuesStep;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.RidSet;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.resultset.ExecutionStream;
+import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderByItem;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLWhereClause;
 import com.jetbrains.youtrackdb.internal.core.storage.ridbag.RidPair;
 import java.util.ArrayList;
@@ -71,6 +73,8 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
   private final String linkBagFieldName;
   private final Index index;
   private final boolean orderAsc;
+  private final SQLOrderByItem comparisonItem;
+  private final ResolvedOrderByNullsPlacement nullsPlacement;
   private final EdgeTraversal edge;
   private final long limit;
 
@@ -167,6 +171,8 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
       String linkBagFieldName,
       Index index,
       boolean orderAsc,
+      SQLOrderByItem comparisonItem,
+      ResolvedOrderByNullsPlacement nullsPlacement,
       EdgeTraversal edge,
       long limit,
       @Nullable IndexOrderedPlanner.MultiSourceMode multiSourceMode,
@@ -185,6 +191,8 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
     this.linkBagFieldName = linkBagFieldName;
     this.index = index;
     this.orderAsc = orderAsc;
+    this.comparisonItem = comparisonItem;
+    this.nullsPlacement = nullsPlacement;
     this.edge = edge;
     this.limit = limit;
     this.multiSourceMode = multiSourceMode;
@@ -333,7 +341,7 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
     var session = ctx.getDatabaseSession();
     var indexDesc = new IndexSearchDescriptor(index);
     var filteredStep = new RidFilteredIndexValuesStep(
-        indexDesc, orderAsc, ctx, profilingEnabled, ridSet);
+        indexDesc, orderAsc, nullsFirst(), ctx, profilingEnabled, ridSet);
     var indexStream = filteredStep.internalStart(ctx);
 
     return indexStream.map((indexResult, mapCtx) -> {
@@ -445,29 +453,22 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
    * <p>Used by loadSortFromLinkBag to produce pre-sorted output that enables LIMIT-based early
    * termination through downstream MATCH edges.
    *
-   * <p>Null placement matches {@link com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderByItem}:
-   * null is the smallest value — nulls first for ASC, nulls last for DESC.
+   * <p>The planner resolves null placement once and stores it in this step. The shared ORDER BY
+   * comparison then applies explicit clauses and direction-specific defaults consistently.
    */
-  @SuppressWarnings("unchecked")
   private void sortByOrderProperty(List<Result> records) {
-    var propertyName =
-        index.getDefinition().getProperties().iterator().next();
     records.sort((a, b) -> {
-      var va = (Comparable<Object>) a.getProperty(propertyName);
-      var vb = (Comparable<Object>) b.getProperty(propertyName);
-      int cmp;
-      if (va == null) {
-        cmp = vb == null ? 0 : -1;
-      } else if (vb == null) {
-        cmp = 1;
-      } else {
-        cmp = va.compareTo(vb);
-      }
+      var cmp = comparisonItem.compare(a, b, ctx, nullsPlacement);
       if (cmp == 0 && ridTieBreakAccepted) {
         cmp = a.getIdentity().compareTo(b.getIdentity());
+        return orderAsc ? cmp : -cmp;
       }
-      return orderAsc ? cmp : -cmp;
+      return cmp;
     });
+  }
+
+  private boolean nullsFirst() {
+    return comparisonItem.nullsFirstFor(nullsPlacement);
   }
 
   // =====================================================================
@@ -626,7 +627,7 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
     signalIndexOrderedOutput(ctx);
     var indexDesc = new IndexSearchDescriptor(index);
     var filteredStep = new RidFilteredIndexValuesStep(
-        indexDesc, orderAsc, ctx, profilingEnabled, unionRidSet);
+        indexDesc, orderAsc, nullsFirst(), ctx, profilingEnabled, unionRidSet);
     var indexStream = filteredStep.internalStart(ctx);
 
     // Shared empty upstream — safe because MatchResultRow never writes to parent
@@ -715,7 +716,7 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
 
     var indexDesc = new IndexSearchDescriptor(index);
     var fullScan = new RidFilteredIndexValuesStep(
-        indexDesc, orderAsc, ctx, profilingEnabled, null);
+        indexDesc, orderAsc, nullsFirst(), ctx, profilingEnabled, null);
     var indexStream = fullScan.internalStart(ctx);
 
     return indexStream.flatMap((indexResult, mapCtx) -> {
@@ -772,7 +773,7 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
 
     var indexDesc = new IndexSearchDescriptor(index);
     var fullScan = new RidFilteredIndexValuesStep(
-        indexDesc, orderAsc, ctx, profilingEnabled, null);
+        indexDesc, orderAsc, nullsFirst(), ctx, profilingEnabled, null);
     var indexStream = fullScan.internalStart(ctx);
 
     var emptyUpstream = new ResultInternal(session);
@@ -849,7 +850,7 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
     // Scan index filtered by union RidSet (seqRead per entry, bitmap check)
     var indexDesc = new IndexSearchDescriptor(index);
     var filteredStep = new RidFilteredIndexValuesStep(
-        indexDesc, orderAsc, ctx, profilingEnabled, unionRidSet);
+        indexDesc, orderAsc, nullsFirst(), ctx, profilingEnabled, unionRidSet);
     var indexStream = filteredStep.internalStart(ctx);
 
     // Per match: load record, reverse edge → find upstream row(s).
@@ -867,7 +868,7 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
       Map<RID, List<Result>> sourceMap, CommandContext ctx) {
     var indexDesc = new IndexSearchDescriptor(index);
     var fullScan = new RidFilteredIndexValuesStep(
-        indexDesc, orderAsc, ctx, profilingEnabled, null);
+        indexDesc, orderAsc, nullsFirst(), ctx, profilingEnabled, null);
     var indexStream = fullScan.internalStart(ctx);
 
     return indexStream.flatMap(
@@ -1262,7 +1263,7 @@ public class IndexOrderedEdgeStep extends AbstractExecutionStep {
   public IndexOrderedEdgeStep copy(CommandContext ctx) {
     return new IndexOrderedEdgeStep(
         ctx, sourceAlias, targetAlias, edgeClassName, linkBagFieldName,
-        index, orderAsc, edge.copy(), limit, multiSourceMode,
+        index, orderAsc, comparisonItem.copy(), nullsPlacement, edge.copy(), limit, multiSourceMode,
         reverseFieldName, sourceClassName, targetFilter, targetClassName,
         edgeTraversal, downstreamEdgeCount, ridTieBreakAccepted, profilingEnabled);
   }

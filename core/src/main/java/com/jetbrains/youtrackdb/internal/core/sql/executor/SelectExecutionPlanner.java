@@ -10,12 +10,14 @@ import com.jetbrains.youtrackdb.internal.core.db.record.record.Identifiable;
 import com.jetbrains.youtrackdb.internal.core.exception.CommandExecutionException;
 import com.jetbrains.youtrackdb.internal.core.id.RecordIdInternal;
 import com.jetbrains.youtrackdb.internal.core.index.Index;
+import com.jetbrains.youtrackdb.internal.core.index.IndexDefinition;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.PropertyTypeInternal;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.SchemaInternal;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.Collate;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.PropertyType;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.SchemaClass;
 import com.jetbrains.youtrackdb.internal.core.query.Result;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.IndexOrderedPlanner;
 import com.jetbrains.youtrackdb.internal.core.sql.operator.QueryOperatorEquals;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.AggregateProjectionSplit;
@@ -231,6 +233,26 @@ public class SelectExecutionPlanner {
    */
   public InternalExecutionPlan createExecutionPlan(
       CommandContext ctx, boolean enableProfiling, boolean useCache) {
+    var scopeSession = ctx.getDatabaseSession();
+    if (scopeSession == null) {
+      // A context with no session reads no configuration, so there is no placement to scope.
+      return buildExecutionPlan(ctx, enableProfiling, useCache);
+    }
+    // Bracket the whole build in a null placement scope. Every placement read below then returns one
+    // resolved pair, and the plan published to the shared cache carries exactly that pair as its
+    // stamp. A nested build joins this scope, so an embedded plan cannot disagree with its host.
+    var placements = scopeSession.getPlanNullPlacements();
+    placements.open();
+    try {
+      return buildExecutionPlan(ctx, enableProfiling, useCache);
+    } finally {
+      placements.close();
+    }
+  }
+
+  /** Runs the planning pipeline inside an open null placement scope. */
+  private InternalExecutionPlan buildExecutionPlan(
+      CommandContext ctx, boolean enableProfiling, boolean useCache) {
     var session = ctx.getDatabaseSession();
 
     // --- 1. Check the plan cache before doing any work ---
@@ -304,7 +326,10 @@ public class SelectExecutionPlanner {
         && statement.executinPlanCanBeCached(session)
         && result.canBeCached()
         && YqlExecutionPlanCache.getLastInvalidation(session) < planningStart) {
-      YqlExecutionPlanCache.put(cacheKey, result, ctx.getDatabaseSession());
+      // Stamp the plan with the placement this build read, still inside the scope. A build that read
+      // none stamps nothing, so a lookup of that plan does no placement work.
+      YqlExecutionPlanCache.put(
+          cacheKey, result, session, session.getPlanNullPlacements().recorded());
     }
     return result;
   }
@@ -2910,10 +2935,20 @@ public class SelectExecutionPlanner {
         }
       }
       if (indexFound && orderType != null) {
+        var orderAsc = orderType.equals(SQLOrderByItem.ASC);
+        var placements = ctx.getDatabaseSession().getPlanNullPlacements().resolve();
+        // Null-key stream placement follows the first ORDER BY item. An explicit clause wins over
+        // the direction-specific setting. A single-property index can move its null bucket.
+        // Composite keys keep null components inline and can only provide natural placement.
+        var nullsFirst = info.orderBy.getItems().getFirst().nullsFirstFor(placements);
+        if (!canProduceNullPlacement(idx.getDefinition(), info.orderBy, orderAsc, placements)) {
+          continue;
+        }
         plan.chain(
             new FetchFromIndexValuesStep(
                 new IndexSearchDescriptor(idx),
-                orderType.equals(SQLOrderByItem.ASC),
+                orderAsc,
+                nullsFirst,
                 ctx,
                 profilingEnabled));
         IntArrayList filterCollectionIds;
@@ -3181,8 +3216,19 @@ public class SelectExecutionPlanner {
       var desc = optimumIndexSearchDescriptors.getFirst();
       result = new ArrayList<>();
       var orderAsc = getOrderDirection(info);
+      var ascending = !Boolean.FALSE.equals(orderAsc);
+      // When ORDER BY is present, place the null-key stream per the first item's resolved null
+      // ordering so a fullySorted index plan matches in-memory null placement. Without ORDER BY,
+      // keep the shipped placement for the direction and read no placement at all.
+      var nullsFirst =
+          (info.orderBy != null && !info.orderBy.getItems().isEmpty())
+              ? info.orderBy
+                  .getItems()
+                  .getFirst()
+                  .nullsFirstFor(ctx.getDatabaseSession().getPlanNullPlacements().resolve())
+              : ascending;
       result.add(
-          new FetchFromIndexStep(desc, !Boolean.FALSE.equals(orderAsc), ctx, profilingEnabled));
+          new FetchFromIndexStep(desc, ascending, nullsFirst, ctx, profilingEnabled));
       IntArrayList filterCollectionIds;
       if (filterCollections != null) {
         filterCollectionIds = classCollectionsFiltered(ctx.getDatabaseSession(), clazz,
@@ -3200,7 +3246,8 @@ public class SelectExecutionPlanner {
       if (isHierarchyRoot
           && orderAsc != null
           && info.orderBy != null
-          && fullySorted(info.orderBy, desc)) {
+          && fullySorted(
+              info.orderBy, desc, ctx.getDatabaseSession().getPlanNullPlacements().resolve())) {
         info.orderApplied = true;
       }
       if (desc.getRemainingCondition() != null && !desc.getRemainingCondition().isEmpty()) {
@@ -3240,12 +3287,18 @@ public class SelectExecutionPlanner {
    * Returns {@code true} if the ORDER BY is fully covered by the index field order
    * in the given descriptor (i.e. no in-memory sort is needed).
    */
-  private static boolean fullySorted(SQLOrderBy orderBy, IndexSearchDescriptor desc) {
+  private static boolean fullySorted(
+      SQLOrderBy orderBy, IndexSearchDescriptor desc,
+      ResolvedOrderByNullsPlacement placements) {
     if (orderBy.ordersWithCollate() || !orderBy.ordersSameDirection()) {
       return false;
     }
-    if (IndexOrderedPlanner.isMultiValueDefinition(desc.getIndex().getDefinition())
-        || !IndexOrderedPlanner.isDefaultCollate(desc.getIndex().getDefinition().getCollate())) {
+    var definition = desc.getIndex().getDefinition();
+    // Every item shares one direction here, and an item with no declared type sorts ascending.
+    var orderAsc = !SQLOrderByItem.DESC.equals(orderBy.getItems().getFirst().getType());
+    if (IndexOrderedPlanner.isMultiValueDefinition(definition)
+        || !IndexOrderedPlanner.isDefaultCollate(definition.getCollate())
+        || !canProduceNullPlacement(definition, orderBy, orderAsc, placements)) {
       return false;
     }
     for (var item : orderBy.getItems()) {
@@ -3254,6 +3307,34 @@ public class SelectExecutionPlanner {
       }
     }
     return desc.fullySorted(orderBy.getProperties());
+  }
+
+  /**
+   * Whether the index can produce the requested null placement for every item of {@code orderBy}.
+   *
+   * <p>A single-property index owns a separate null bucket, which the fetch step concatenates before
+   * or after the ordered keys, so it can produce either placement and the check passes at once.
+   *
+   * <p>A composite index keeps a null component inside the key, so its scan yields only the natural
+   * placement, which is first for an ascending scan and last for a descending one. Every item the
+   * shortcut would satisfy must request that natural placement, because one item asking for the
+   * other end would need a bucket move a composite key cannot do. Reading the leading item alone
+   * would keep the shortcut for {@code ORDER BY a ASC, b ASC NULLS LAST} and return a wrong order.
+   */
+  private static boolean canProduceNullPlacement(
+      IndexDefinition definition,
+      SQLOrderBy orderBy,
+      boolean orderAsc,
+      ResolvedOrderByNullsPlacement placements) {
+    if (definition.getProperties().size() < 2) {
+      return true;
+    }
+    for (var item : orderBy.getItems()) {
+      if (item.nullsFirstFor(placements) != orderAsc) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

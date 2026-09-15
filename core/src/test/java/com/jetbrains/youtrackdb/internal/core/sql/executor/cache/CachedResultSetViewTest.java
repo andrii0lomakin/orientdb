@@ -2,10 +2,13 @@ package com.jetbrains.youtrackdb.internal.core.sql.executor.cache;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import com.jetbrains.youtrackdb.api.DatabaseType;
+import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
+import com.jetbrains.youtrackdb.api.config.OrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.DbTestBase;
 import com.jetbrains.youtrackdb.internal.core.command.BasicCommandContext;
 import com.jetbrains.youtrackdb.internal.core.command.CommandContext;
@@ -16,6 +19,7 @@ import com.jetbrains.youtrackdb.internal.core.db.record.record.RID;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.PropertyType;
 import com.jetbrains.youtrackdb.internal.core.query.Result;
 import com.jetbrains.youtrackdb.internal.core.record.RecordAbstract;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.ResultInternal;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.resultset.ExecutionStream;
 import com.jetbrains.youtrackdb.internal.core.sql.parser.SQLOrderBy;
@@ -24,6 +28,7 @@ import com.jetbrains.youtrackdb.internal.core.sql.parser.YouTrackDBSql;
 import com.jetbrains.youtrackdb.internal.core.tx.FrontendTransactionImpl;
 import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -635,5 +640,48 @@ public class CachedResultSetViewTest {
     assertEquals("Entry stays pinned while the second view iterates", 1, entry.getLiveViewCount());
     b.close();
     assertEquals(0, entry.getLiveViewCount());
+  }
+
+  // ===========================================================================
+  // Null placement
+  // ===========================================================================
+
+  /**
+   * A view over an entry with no ORDER BY never compares rows, so it must never resolve a null
+   * placement. Resolving would take the storage configuration lock on a path that was free before.
+   */
+  @Test
+  public void viewWithoutOrderByNeverResolvesNullPlacement() {
+    var entry = recordEntry(null, List.of(newRec(1), newRec(2)));
+    var inject = List.<Result>of(resultOf(newRec(9)));
+    var view = new CachedResultSetView(entry, cursor(Set.of(), inject), db, tx(), null, ctx());
+
+    assertEquals(3, drainValues(view).size());
+    assertNull("a view with no sort key must not read the configuration",
+        entry.fixedNullsDefault());
+  }
+
+  /**
+   * The merge ranks rows by the entry's placement, which the delta build already used to sort the
+   * inject list. The storage setting puts nulls last. An injected row with no sort key must be
+   * emitted after both cached rows. The entry must then hold exactly one resolved placement.
+   */
+  @Test
+  public void mergeUsesThePlacementOwnedByTheEntry() {
+    var storageConfig = db.getStorage().getContextConfiguration();
+    storageConfig.setValue(
+        GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC, OrderByNullsPlacement.LAST);
+    try {
+      var orderBy = parseOrderBy("SELECT FROM " + CLASS_NAME + " ORDER BY " + FIELD + " ASC");
+      var entry = recordEntry(orderBy, List.of(newRec(1), newRec(2)));
+      var inject = List.<Result>of(resultOf(db.newEntity(CLASS_NAME)));
+      var view = new CachedResultSetView(entry, cursor(Set.of(), inject), db, tx(), null, ctx());
+
+      assertEquals(Arrays.asList(1, 2, null), drainValues(view));
+      assertEquals(new ResolvedOrderByNullsPlacement(
+          OrderByNullsPlacement.LAST, OrderByNullsPlacement.LAST), entry.fixedNullsDefault());
+    } finally {
+      storageConfig.setValue(GlobalConfiguration.QUERY_ORDER_BY_NULLS_PLACEMENT_ASC, null);
+    }
   }
 }

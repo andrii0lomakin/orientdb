@@ -877,6 +877,43 @@ public class SelectStatementTest extends DbTestBase {
     checkWrongSyntax("select from V order by foo asc collate ");
   }
 
+  /**
+   * FIRST/LAST/NULLS are ORDER BY keywords ({@code NULLS FIRST|LAST}) but must remain usable as
+   * identifiers so {@code first()}/{@code last()} and aliases like {@code AS first} still parse.
+   * Regression for the CI failures on YTDB-1198 when those tokens were reserved without being
+   * added to {@code Identifier()}.
+   */
+  @Test
+  public void testFirstLastRemainIdentifiersAlongsideNullsOrdering() {
+    checkRightSyntax("select first(addresses) from V");
+    checkRightSyntax("select last(addresses) from V");
+    checkRightSyntax("select first(addresses) as first from V order by first");
+    checkRightSyntax("select last(addresses) as last from V order by last desc");
+    checkRightSyntax("select from V order by last");
+    checkRightSyntax("select from V order by foo nulls first");
+    checkRightSyntax("select from V order by foo asc nulls last");
+    checkRightSyntax("select from V order by foo desc nulls first, bar nulls last");
+    // alias named first, then an explicit nulls clause on that item
+    checkRightSyntax("select first(addresses) as first from V order by first nulls last");
+    checkRightSyntax("select from V order by `nulls` nulls first");
+    checkWrongSyntax("select from V order by foo nulls");
+    checkWrongSyntax("select from V order by foo nulls asc");
+
+    var nullsFirst =
+        (SQLSelectStatement) checkSyntax("select from V order by foo nulls first", true);
+    assertEquals(
+        SQLOrderByItem.NULLS_FIRST,
+        nullsFirst.getOrderBy().getItems().getFirst().getNullOrdering());
+
+    var aliasThenNulls =
+        (SQLSelectStatement)
+            checkSyntax("select first(addresses) as first from V order by first nulls last", true);
+    assertEquals(
+        SQLOrderByItem.NULLS_LAST,
+        aliasThenNulls.getOrderBy().getItems().getFirst().getNullOrdering());
+    assertEquals("first", aliasThenNulls.getOrderBy().getItems().getFirst().getAlias());
+  }
+
   protected static void checkGenericStatement(String query, String expectedGeneric) {
     var result = checkSyntax(query, true);
     Assert.assertEquals(expectedGeneric, result.toGenericStatement());

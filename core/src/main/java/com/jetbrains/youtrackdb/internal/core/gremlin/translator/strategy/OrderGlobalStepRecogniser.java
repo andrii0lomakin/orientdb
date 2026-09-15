@@ -1,5 +1,6 @@
 package com.jetbrains.youtrackdb.internal.core.gremlin.translator.strategy;
 
+import com.jetbrains.youtrackdb.api.config.OrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.BoundaryOutputType;
 import com.jetbrains.youtrackdb.internal.core.gremlin.traversal.lambda.RecordIdSortKeyTraversal;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.builder.ByModulatorTranslator;
@@ -110,6 +111,11 @@ final class OrderGlobalStepRecogniser implements StepRecogniser {
       if (item == null) {
         return Outcome.DECLINE;
       }
+      var placement = ctx.orderByNullsPlacements().forDirection(ascending);
+      item.setNullOrdering(
+          placement == OrderByNullsPlacement.FIRST
+              ? SQLOrderByItem.NULLS_FIRST
+              : SQLOrderByItem.NULLS_LAST);
       items.add(item);
     }
 

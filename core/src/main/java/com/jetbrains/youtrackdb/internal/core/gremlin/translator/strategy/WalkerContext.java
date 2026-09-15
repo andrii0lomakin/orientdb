@@ -6,6 +6,7 @@ import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.PostConcat
 import com.jetbrains.youtrackdb.internal.core.gremlin.translator.step.ResultShaping;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.PropertyType;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.Schema;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.MatchPlanInputs;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.builder.MatchPatternBuilder;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.match.builder.MatchProjectionBuilder;
@@ -118,6 +119,10 @@ final class WalkerContext implements RecognitionContext {
   /** Whether a global-scope order() keeps a record missing the ordered key. See
    *  {@link #setOrderIncludesMissingKey}. */
   private boolean orderIncludesMissingKey;
+
+  /** Direction-specific null placements for translated order items. */
+  private ResolvedOrderByNullsPlacement orderByNullsPlacements =
+      ResolvedOrderByNullsPlacement.SHIPPED;
 
   /** {@code ORDER BY} clause for {@code order()} terminators. */
   @Nullable SQLOrderBy orderBy;
@@ -378,6 +383,15 @@ final class WalkerContext implements RecognitionContext {
   @Override
   public boolean orderIncludesMissingKey() {
     return orderIncludesMissingKey;
+  }
+
+  void setOrderByNullsPlacements(ResolvedOrderByNullsPlacement placements) {
+    orderByNullsPlacements = placements;
+  }
+
+  @Override
+  public ResolvedOrderByNullsPlacement orderByNullsPlacements() {
+    return orderByNullsPlacements;
   }
 
   /**

@@ -68,6 +68,16 @@ public abstract class AbstractMetadataUpdateCache<K, V> implements MetadataUpdat
     return cacheEnabled() ? cache.getIfPresent(key) : null;
   }
 
+  /**
+   * Drops one cached entry, leaving every other entry and the invalidate timestamp untouched. Used
+   * by a per-entry staleness gate, which must not punish the entries it did not judge.
+   */
+  protected final void invalidateCached(K key) {
+    if (cacheEnabled()) {
+      cache.invalidate(key);
+    }
+  }
+
   protected final void putCached(K key, V value) {
     if (cacheEnabled()) {
       cache.put(key, value);

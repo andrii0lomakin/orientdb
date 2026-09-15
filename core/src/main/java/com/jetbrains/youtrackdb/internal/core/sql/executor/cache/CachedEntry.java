@@ -4,6 +4,8 @@ import com.jetbrains.youtrackdb.internal.core.command.CommandContext;
 import com.jetbrains.youtrackdb.internal.core.db.record.record.RID;
 import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.SchemaClass;
 import com.jetbrains.youtrackdb.internal.core.query.Result;
+import com.jetbrains.youtrackdb.internal.core.sql.OrderByNullsUtil;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.InternalExecutionPlan;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.resultset.ExecutionStream;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.resultset.IdempotentExecutionStream;
@@ -125,6 +127,29 @@ public final class CachedEntry {
   @Nullable private List<Result> cachedInjectList;
 
   private long cachedDeltaVersion = -1;
+
+  /**
+   * Null placement for every ORDER BY comparison this entry drives.
+   *
+   * <p>The cache fixes it at populate through {@link #seedNullsDefault}, and it never changes after
+   * that. One value per entry is required for correctness, not for speed. The delta builder sorts
+   * the inject list, and the view merges that list against the cached rows. Two reads could straddle
+   * a configuration change, and the merged result would then come out unsorted.
+   *
+   * <p>Populate is the right moment because the rows the populating execution froze are already
+   * ordered under the value in force then. The cache resolves the value before that execution builds
+   * its plan, so the seed is the value the plan itself read. A later reading would rank the injected
+   * rows against a cached prefix ordered the other way.
+   *
+   * <p>The seed is also what makes the entry placement sensitive, so it is installed for every
+   * statement that ranks its rows. A multi-alias MATCH is such a statement even though its entry
+   * carries no merge {@link #orderBy}, because it replays tuples the plan already ordered.
+   *
+   * <p>Stays {@code null} for an entry that ranks nothing, which never compares rows. An entry built
+   * outside the cache, as a test does, may also reach a comparison unseeded. The first comparison
+   * then fixes the value, so the one-value rule holds either way.
+   */
+  @Nullable private ResolvedOrderByNullsPlacement nullsDefault;
 
   // Per-entry record-cap guard. The cache installs the cap and the overflow callback at put time; the
   // view's row append checks the cap so an entry whose populate crosses it removes itself from the
@@ -263,6 +288,79 @@ public final class CachedEntry {
 
   @Nullable public SQLOrderBy getOrderBy() {
     return orderBy;
+  }
+
+  /**
+   * Fixes the null placement of this entry at populate, before any row is compared.
+   *
+   * <p>The cache calls this for an entry that carries an ORDER BY. A second call keeps the first
+   * placement, because comparisons may already have used it and two placements on one entry would
+   * rank rows differently. Such a call is a construction bug in the cache, so an assertion fails it
+   * in tests. Production keeps the first value instead of throwing, because a throw here would roll
+   * back the user transaction.
+   *
+   * @param seeded the placement in force when this entry was populated
+   */
+  public void seedNullsDefault(@Nonnull ResolvedOrderByNullsPlacement seeded) {
+    assert nullsDefault == null
+        : "the null placement of a cached entry is fixed once, at populate";
+    if (nullsDefault == null) {
+      nullsDefault = seeded;
+    }
+  }
+
+  /**
+   * The null placement every comparison on this entry uses.
+   *
+   * <p>Returns the seed the cache installed at populate. An entry built outside the cache has no
+   * seed, and then this call fixes the value from {@code ctx}. Call it only where a comparison
+   * follows, because an unseeded first call reads the storage configuration under its lock.
+   *
+   * @param ctx the context of the query that drives the comparison
+   */
+  @Nonnull
+  public ResolvedOrderByNullsPlacement nullsDefault(@Nonnull CommandContext ctx) {
+    if (nullsDefault == null) {
+      nullsDefault = OrderByNullsUtil.resolvePlacementsForSort(ctx);
+    }
+    return nullsDefault;
+  }
+
+  /**
+   * The placement already fixed for this entry, or {@code null} when none is. Exposed so a test can
+   * prove that populate seeds it, and that an entry with no ORDER BY never reads the configuration.
+   */
+  @Nullable ResolvedOrderByNullsPlacement fixedNullsDefault() {
+    return nullsDefault;
+  }
+
+  /**
+   * Whether a placement change can make this entry stale.
+   *
+   * <p>An entry is placement sensitive once the cache froze a placement on it at populate, which the
+   * cache does for every statement that ranks its rows. An entry that carries a merge ORDER BY is
+   * sensitive as well, even with no seed, so a construction that skipped the seed still reaches the
+   * gate below rather than being served blind.
+   *
+   * <p>Reading this before the gate keeps a lookup that cannot go stale free of any placement work.
+   */
+  boolean isPlacementSensitive() {
+    return nullsDefault != null || orderBy != null;
+  }
+
+  /**
+   * Returns whether this entry remains valid under {@code current}.
+   *
+   * <p>A seeded entry stays valid only while the seed still matches, because its frozen rows are
+   * ordered by the seed. An entry with a merge ORDER BY and no seed is treated as stale rather than
+   * resolved after the fact, since the cache seeds every ordered entry before publication. An entry
+   * that ranks nothing does not depend on placement at all.
+   */
+  boolean hasCurrentNullPlacement(@Nonnull ResolvedOrderByNullsPlacement current) {
+    if (nullsDefault != null) {
+      return current.equals(nullsDefault);
+    }
+    return orderBy == null;
   }
 
   /**

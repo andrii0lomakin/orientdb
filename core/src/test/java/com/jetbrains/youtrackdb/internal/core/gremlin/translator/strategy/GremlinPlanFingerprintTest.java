@@ -91,6 +91,18 @@ public class GremlinPlanFingerprintTest {
         .isNotEqualTo(GremlinPlanFingerprint.fingerprint(fpLikes));
   }
 
+  /** Explicit null placement in ORDER BY distinguishes the built-plan cache fingerprint. */
+  @Test
+  public void orderByNullPlacement_distinguishesFingerprint() {
+    var nullsFirst =
+        parse("MATCH {class: V, as: a} RETURN a ORDER BY a.name ASC NULLS FIRST");
+    var nullsLast =
+        parse("MATCH {class: V, as: a} RETURN a ORDER BY a.name ASC NULLS LAST");
+
+    assertThat(fingerprintFromStatementClauses(nullsFirst))
+        .isNotEqualTo(fingerprintFromStatementClauses(nullsLast));
+  }
+
   /** UNWIND expands collections; present vs absent must not share a fingerprint. */
   @Test
   public void unwind_distinguishesFingerprint() {

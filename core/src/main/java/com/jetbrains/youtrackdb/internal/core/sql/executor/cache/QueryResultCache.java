@@ -1,6 +1,7 @@
 package com.jetbrains.youtrackdb.internal.core.sql.executor.cache;
 
 import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
+import com.jetbrains.youtrackdb.internal.core.sql.ResolvedOrderByNullsPlacement;
 import com.jetbrains.youtrackdb.internal.core.sql.executor.resultset.IdempotentExecutionStream;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -9,6 +10,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Supplier;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
@@ -116,20 +118,44 @@ public final class QueryResultCache {
   }
 
   /**
-   * Looks up the entry for {@code key} at the transaction's current mutation version.
-   *
-   * <p>Returns {@code null} — caller falls back to uncached execution — when: the key is in {@link
-   * #nonCacheableKeys}; no entry is cached; or a {@link CacheableShape#K0_NONE} entry's populate
-   * version no longer equals {@code currentMutationVersion}. The version-mismatch case also evicts the
-   * stale entry, counts a K0 invalidation, and routes the key to the non-cacheable set after the
-   * configured number of strikes. A returned entry has been moved to the most-recently-used end and
-   * its {@code hits} counter incremented; a {@code null} return for a real cache miss (key absent, not
-   * a guard rejection) increments {@code misses}.
+   * Looks up the entry for {@code key} with no null placement gate, for a caller that cannot resolve
+   * the current placement. Every production caller uses {@link #lookup(CacheKey, long, Supplier)}
+   * instead, because an entry frozen under a placement that has since changed stays servable here.
    *
    * @param currentMutationVersion the owning transaction's mutation version at lookup time, used only
    *     to gate {@link CacheableShape#K0_NONE} entries.
    */
   @Nullable public CachedEntry lookup(@Nonnull CacheKey key, long currentMutationVersion) {
+    return lookup(key, currentMutationVersion, null);
+  }
+
+  /**
+   * Looks up the entry for {@code key} at the transaction's current mutation version, rejecting an
+   * entry whose populate-time null placement no longer matches the database setting.
+   *
+   * <p>Returns {@code null} — caller falls back to uncached execution — when: the key is in {@link
+   * #nonCacheableKeys}; no entry is cached; a {@link CacheableShape#K0_NONE} entry's populate version
+   * no longer equals {@code currentMutationVersion}; or a placement-sensitive entry froze another
+   * placement than {@code currentNullPlacements} reports. The version-mismatch case also evicts the
+   * stale entry, counts a K0 invalidation, and routes the key to the non-cacheable set after the
+   * configured number of strikes. The placement-mismatch case evicts the entry too.
+   *
+   * <p>Accounting: a returned entry has been moved to the most-recently-used end and its {@code hits}
+   * counter incremented. An absent key counts a miss, and so does a placement rejection, because
+   * either way the caller runs the query for real. A bypassed key and a version-gate rejection count
+   * no miss, since the first was accounted when the key was routed out and the second counts its own
+   * invalidation.
+   *
+   * <p>The supplier runs only after a placement-sensitive entry is found, so a miss, a bypass and a
+   * hit on an entry that ranks nothing all stay free of configuration resolution.
+   *
+   * @param currentMutationVersion the owning transaction's mutation version at lookup time, used only
+   *     to gate {@link CacheableShape#K0_NONE} entries.
+   */
+  @Nullable public CachedEntry lookup(
+      @Nonnull CacheKey key,
+      long currentMutationVersion,
+      @Nullable Supplier<ResolvedOrderByNullsPlacement> currentNullPlacements) {
     if (nonCacheableKeys.contains(key)) {
       // Permanently bypassed key (overflowed or K0-strike-exceeded). Not counted as a cache miss: the
       // decision to bypass was already accounted for when the key was routed to the set.
@@ -151,6 +177,15 @@ public final class QueryResultCache {
       if (strikes >= k0NoneInvalidationThreshold) {
         nonCacheableKeys.add(key);
       }
+      return null;
+    }
+    if (currentNullPlacements != null
+        && entry.isPlacementSensitive()
+        && !entry.hasCurrentNullPlacement(currentNullPlacements.get())) {
+      // The frozen rows use the populate-time placement. Remove the entry before recording a hit,
+      // then count the fresh execution driven by this rejection as a cache miss.
+      invalidate(key, entry);
+      metrics.incrementMisses();
       return null;
     }
     if (entry.getShape() == CacheableShape.MATCH_TUPLE_MULTI) {

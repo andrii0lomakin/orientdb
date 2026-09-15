@@ -1456,6 +1456,32 @@ public enum GlobalConfiguration {
       10,
       true),
 
+  /**
+   * Null placement for ascending {@code ORDER BY} items and Gremlin {@code Order.asc} when no
+   * explicit placement is given. Per-storage values override the runtime global.
+   */
+  QUERY_ORDER_BY_NULLS_PLACEMENT_ASC(
+      "youtrackdb.query.orderBy.nullsPlacementAsc",
+      "Null placement for ascending ORDER BY items and Gremlin Order.asc. Ships as FIRST. "
+          + "Per-storage settings override the runtime global. "
+          + "An explicit NULLS FIRST/LAST clause overrides this setting.",
+      OrderByNullsPlacement.class,
+      OrderByNullsPlacement.FIRST,
+      true),
+
+  /**
+   * Null placement for descending {@code ORDER BY} items and Gremlin {@code Order.desc} when no
+   * explicit placement is given. Per-storage values override the runtime global.
+   */
+  QUERY_ORDER_BY_NULLS_PLACEMENT_DESC(
+      "youtrackdb.query.orderBy.nullsPlacementDesc",
+      "Null placement for descending ORDER BY items and Gremlin Order.desc. Ships as LAST. "
+          + "Per-storage settings override the runtime global. "
+          + "An explicit NULLS FIRST/LAST clause overrides this setting.",
+      OrderByNullsPlacement.class,
+      OrderByNullsPlacement.LAST,
+      true),
+
   QUERY_INDEX_ORDERED_MIN_LINKBAG(
       "youtrackdb.query.indexOrdered.minLinkBag",
       "Minimum LinkBag size below which the index-ordered MATCH optimization"
