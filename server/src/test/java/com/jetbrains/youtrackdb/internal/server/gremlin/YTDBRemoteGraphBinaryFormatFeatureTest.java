@@ -5,6 +5,7 @@ import com.google.inject.Guice;
 import com.google.inject.Injector;
 import com.google.inject.Stage;
 import com.jetbrains.youtrackdb.api.gremlin.YTDBGraphTraversalSource;
+import com.jetbrains.youtrackdb.internal.core.gremlin.gremlintest.SampleScenarioOrderSemantics;
 import io.cucumber.guice.CucumberModules;
 import io.cucumber.guice.GuiceFactory;
 import io.cucumber.guice.InjectorSource;
@@ -52,8 +53,7 @@ public class YTDBRemoteGraphBinaryFormatFeatureTest {
 
   private static final Map<String, String> IGNORED_TESTS = Map.of(
       "g_injectXhello_hiX_concat_XV_valuesXnameXX",
-      "YouTrackDB doesn't guarantee a consistent order of element's IDs"
-  );
+      "YouTrackDB doesn't guarantee a consistent order of element's IDs");
 
   @SuppressWarnings("NewClassNamingConvention")
   public static final class ServiceModule extends AbstractModule {
@@ -67,11 +67,15 @@ public class YTDBRemoteGraphBinaryFormatFeatureTest {
   @SuppressWarnings("NewClassNamingConvention")
   public static class YTDBGraphWorld implements World {
 
-    public static final YTDBGraphBinaryRemoteGraphProvider provider = new YTDBGraphBinaryRemoteGraphProvider();
+    public static final YTDBGraphBinaryRemoteGraphProvider provider =
+        new YTDBGraphBinaryRemoteGraphProvider();
+
+    private final SampleScenarioOrderSemantics sampleScenarioOrderSemantics =
+        new SampleScenarioOrderSemantics();
 
     @Override
     public GraphTraversalSource getGraphTraversalSource(GraphData graphData) {
-      return doGetTraversalSource(graphData);
+      return sampleScenarioOrderSemantics.decorate(doGetTraversalSource(graphData));
     }
 
     private static YTDBGraphTraversalSource doGetTraversalSource(GraphData graphData) {
@@ -97,9 +101,7 @@ public class YTDBRemoteGraphBinaryFormatFeatureTest {
 
     private static void cleanEmpty() {
       var traversal = doGetTraversalSource(null);
-      traversal.autoExecuteInTx(g ->
-          g.V().drop()
-      );
+      traversal.autoExecuteInTx(g -> g.V().drop());
     }
 
     @Override
@@ -109,6 +111,7 @@ public class YTDBRemoteGraphBinaryFormatFeatureTest {
 
     @Override
     public void beforeEachScenario(final Scenario scenario) {
+      sampleScenarioOrderSemantics.select(scenario.getName());
       if (IGNORED_TESTS.containsKey(scenario.getName())) {
         throw new AssumptionViolatedException(IGNORED_TESTS.get(scenario.getName()));
       }
@@ -126,32 +129,31 @@ public class YTDBRemoteGraphBinaryFormatFeatureTest {
       var fileName = Paths.get(pathToFileFromGremlin).getFileName().toString();
       @SuppressWarnings("UnnecessaryLocalVariable")
       var realPath = PATHS.compute(fileName, (file, path) -> {
-            try {
+        try {
 
-              if (file.endsWith(".kryo")) {
-                var resourceName = fileName.substring(0, fileName.length() - 5) + "-v3.kryo";
-                return TestHelper.generateTempFileFromResource(GryoResourceAccess.class, resourceName,
-                        "")
-                    .getAbsolutePath();
-              }
-              if (file.endsWith(".json")) {
-                var resourceName = fileName.substring(0, fileName.length() - 5) + "-v3.json";
-                return TestHelper.generateTempFileFromResource(GraphSONResourceAccess.class,
-                        resourceName,
-                        "")
-                    .getAbsolutePath();
-              }
-              if (file.endsWith(".xml")) {
-                return TestHelper.generateTempFileFromResource(GraphMLResourceAccess.class, fileName,
-                    "").getAbsolutePath();
-              }
-            } catch (IOException e) {
-              throw new RuntimeException(e);
-            }
-
-            throw new IllegalArgumentException(file + " is not supported");
+          if (file.endsWith(".kryo")) {
+            var resourceName = fileName.substring(0, fileName.length() - 5) + "-v3.kryo";
+            return TestHelper.generateTempFileFromResource(GryoResourceAccess.class, resourceName,
+                "")
+                .getAbsolutePath();
           }
-      );
+          if (file.endsWith(".json")) {
+            var resourceName = fileName.substring(0, fileName.length() - 5) + "-v3.json";
+            return TestHelper.generateTempFileFromResource(GraphSONResourceAccess.class,
+                resourceName,
+                "")
+                .getAbsolutePath();
+          }
+          if (file.endsWith(".xml")) {
+            return TestHelper.generateTempFileFromResource(GraphMLResourceAccess.class, fileName,
+                "").getAbsolutePath();
+          }
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+
+        throw new IllegalArgumentException(file + " is not supported");
+      });
 
       return realPath;
     }
@@ -165,8 +167,7 @@ public class YTDBRemoteGraphBinaryFormatFeatureTest {
       return Guice.createInjector(
           Stage.PRODUCTION,
           CucumberModules.createScenarioModule(),
-          new ServiceModule()
-      );
+          new ServiceModule());
     }
   }
 }

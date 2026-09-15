@@ -8,12 +8,15 @@ import com.jetbrains.youtrackdb.internal.docker.server.features.YTDBDockerGraphF
 import io.cucumber.guice.CucumberModules;
 import io.cucumber.guice.GuiceFactory;
 import io.cucumber.guice.InjectorSource;
+import io.cucumber.java.Scenario;
 import io.cucumber.junit.Cucumber;
 import io.cucumber.junit.CucumberOptions;
 import java.nio.file.Paths;
+import java.util.Set;
 import org.apache.tinkerpop.gremlin.LoadGraphWith.GraphData;
 import org.apache.tinkerpop.gremlin.features.World;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
+import org.apache.tinkerpop.gremlin.process.traversal.strategy.decoration.StandardOrderSemanticsStrategy;
 import org.apache.tinkerpop.gremlin.structure.Element;
 import org.junit.runner.RunWith;
 
@@ -49,10 +52,36 @@ public class YTDBDockerGraphBinaryFormatFeatureTest {
   @SuppressWarnings("NewClassNamingConvention")
   public static class YTDBGraphWorld implements World {
 
+    private static final Set<String> STANDARD_ORDER_SCENARIOS = Set.of(
+        "g_V3_repeatXout_order_byXperformancesX_sampleX2X_aggregateXxXX_"
+            + "untilXloops_isX2XX_capXxX_unfold",
+        "g_V3_out_order_byXperformancesX_sampleX2X_aggregateXxX_out_order_"
+            + "byXperformancesX_sampleX2X_aggregateXxX_capXxX_unfold");
+
+    private boolean standardOrderSemantics;
+
     @Override
     public GraphTraversalSource getGraphTraversalSource(GraphData graphData) {
-      return YTDBDockerGraphFeatureTestHooks.youTrackDB.openTraversal(
+      var source = YTDBDockerGraphFeatureTestHooks.youTrackDB.openTraversal(
           YTDBDockerGraphFeatureTestHooks.getServerGraphName(graphData));
+      return decorate(source);
+    }
+
+    @Override
+    public void beforeEachScenario(Scenario scenario) {
+      selectScenario(scenario.getName());
+    }
+
+    void selectScenario(String scenarioName) {
+      // Replace the previous selection because Cucumber may reuse a World instance.
+      standardOrderSemantics = STANDARD_ORDER_SCENARIOS.contains(scenarioName);
+    }
+
+    GraphTraversalSource decorate(GraphTraversalSource source) {
+      if (standardOrderSemantics) {
+        return source.withStrategies(StandardOrderSemanticsStrategy.instance());
+      }
+      return source;
     }
 
     @Override
@@ -81,9 +110,7 @@ public class YTDBDockerGraphBinaryFormatFeatureTest {
     @Override
     public void afterEachScenario() {
       try (var traversal = YTDBDockerGraphFeatureTestHooks.youTrackDB.openTraversal("graph")) {
-        traversal.autoExecuteInTx(g ->
-            g.V().drop()
-        );
+        traversal.autoExecuteInTx(g -> g.V().drop());
       }
     }
   }
@@ -96,8 +123,7 @@ public class YTDBDockerGraphBinaryFormatFeatureTest {
       return Guice.createInjector(
           Stage.PRODUCTION,
           CucumberModules.createScenarioModule(),
-          new ServiceModule()
-      );
+          new ServiceModule());
     }
   }
 }
