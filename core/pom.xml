@@ -776,20 +776,14 @@
       <version>1.37</version>
       <scope>test</scope>
     </dependency>
-    <!-- plotting -->
+    <!-- Some core tests use JUnit Jupiter APIs directly. Keep those APIs explicit rather than
+         relying on an indirect dependency. The surefire provider remains pinned to JUnit 4
+         by the explicit plugin dependency declared on maven-surefire-plugin above. -->
     <dependency>
-      <groupId>org.knowm.xchart</groupId>
-      <artifactId>xchart</artifactId>
-      <version>3.8.8</version>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
-    <!-- xchart → pdfbox pulls in junit-jupiter transitively. Contrary to an earlier version
-         of this comment, that does NOT change which surefire provider runs: the provider is
-         pinned to surefire-junit47 via the explicit plugin dependency declared on
-         maven-surefire-plugin above, and that pin overrides provider auto-detection based on
-         classpath test frameworks. Under the pinned provider this vintage-engine dependency
-         has no effect; it is kept only defensively, in case the provider pin above is ever
-         removed and JUnit Platform auto-detection takes over. -->
     <dependency>
       <groupId>org.junit.vintage</groupId>
       <artifactId>junit-vintage-engine</artifactId>
