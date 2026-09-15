@@ -59,6 +59,8 @@ public class GraphFeatureWorld implements World {
 
   private final boolean standardOrderSemantics;
   private final GraphSet graphs;
+  private final SampleScenarioOrderSemantics sampleScenarioOrderSemantics =
+      new SampleScenarioOrderSemantics();
 
   protected GraphFeatureWorld(Class<?> testClass) {
     standardOrderSemantics = usesStandardOrderSemantics();
@@ -70,7 +72,7 @@ public class GraphFeatureWorld implements World {
 
   @Override
   public GraphTraversalSource getGraphTraversalSource(GraphData graphData) {
-    return (switch (graphData) {
+    var source = (switch (graphData) {
       case null -> graphs.empty;
       case CLASSIC -> graphs.classic;
       case MODERN -> graphs.modern;
@@ -78,6 +80,7 @@ public class GraphFeatureWorld implements World {
       case GRATEFUL -> graphs.grateful;
       case SINK -> graphs.sink;
     }).traversal();
+    return sampleScenarioOrderSemantics.decorate(source);
   }
 
   @Override
@@ -118,6 +121,7 @@ public class GraphFeatureWorld implements World {
 
   @Override
   public void beforeEachScenario(final Scenario scenario) {
+    sampleScenarioOrderSemantics.select(scenario.getName());
     var ignored = IGNORED_TESTS.get(scenario.getName());
     if (ignored == null && standardOrderSemantics) {
       ignored = STANDARD_ORDER_IGNORED_TESTS.get(scenario.getName());
