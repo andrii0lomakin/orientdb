@@ -130,7 +130,7 @@
       value-equality bugs, so the check is disabled rather than its findings fixed.
     -->
     <errorprone.args>-Xplugin:ErrorProne -XepExcludedPaths:.*/target/generated-sources/.*|.*/internal/core/sql/parser/.*|.*/src/test/.*|.*/generated-test-sources/.* -XepOpt:NullAway:OnlyNullMarked=true -Xep:NullAway:ERROR -Xep:BooleanLiteral:ERROR -Xep:MissingSummary:ERROR -Xep:StringCaseLocaleUsage:ERROR -Xep:PatternMatchingInstanceof:ERROR -Xep:UnusedVariable:ERROR -Xep:UnnecessaryParentheses:ERROR -Xep:MixedMutabilityReturnType:ERROR -Xep:SystemOut:ERROR -Xep:CheckedExceptionNotThrown:ERROR -Xep:RemoveUnusedImports:ERROR -Xep:MissingOverride:ERROR -Xep:ImmutableEnumChecker:ERROR -Xep:EffectivelyPrivate:ERROR -Xep:StatementSwitchToExpressionSwitch:ERROR -Xep:OperatorPrecedence:ERROR -Xep:InvalidParam:ERROR -Xep:EmptyBlockTag:ERROR -Xep:ReferenceEquality:OFF -Xep:EqualsGetClass:ERROR -Xep:StringSplitter:ERROR -Xep:TypeParameterUnusedInFormals:ERROR -Xep:NonApiType:OFF</errorprone.args>
-    <spotless.version>3.4.0</spotless.version>
+    <spotless.version>3.10.1</spotless.version>
   </properties>
 
 
